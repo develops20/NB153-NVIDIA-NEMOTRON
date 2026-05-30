@@ -41,17 +41,12 @@ TRAIN_CSV_PATH = os.path.join(DATA_DIR, "train.csv")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ─── Mode flags ────────────────────────────────────────────────────────
-QUICKMODE = os.environ.get("QUICKMODE", "0").lower() in ("1", "true", "yes")
-QUICKMODE_MAX_TRAIN = int(os.environ.get("QUICKMODE_MAX_TRAIN", "100"))
-QUICKMODE_MAX_VAL   = int(os.environ.get("QUICKMODE_MAX_VAL",   "100"))
-
 # Save a checkpoint every N optimizer steps (0 disables intra-epoch saves)
 SAVE_EVERY_STEPS = int(os.environ.get("SAVE_EVERY_STEPS", "200"))
 KEEP_LAST_N      = int(os.environ.get("KEEP_LAST_N", "2"))
 
 SESSION_START = time.time()
-print(f"[init] mode={'QUICK' if QUICKMODE else 'FULL'} | data={DATA_DIR} | model={MODEL_PATH}", flush=True)
+print(f"[init] data={DATA_DIR} | model={MODEL_PATH}", flush=True)
 print(f"[init] output={OUTPUT_DIR} | checkpoints={CHECKPOINT_DIR} | save_every={SAVE_EVERY_STEPS}", flush=True)
 
 # ─── Imports (heavy) ───────────────────────────────────────────────────
@@ -65,7 +60,7 @@ from solvers.solver import extract_boxed_answer, reasoning_result_matches
 # ─── Hyperparameters ───────────────────────────────────────────────────
 LORA_RANK    = 32
 MAX_SEQ_LEN  = 2048
-NUM_EPOCHS   = 1 if QUICKMODE else int(os.environ.get("NUM_EPOCHS", "2"))
+NUM_EPOCHS   = int(os.environ.get("NUM_EPOCHS", "2"))
 GRAD_ACCUM   = int(os.environ.get("GRAD_ACCUM", "4"))
 LR           = float(os.environ.get("LR", "2e-4"))
 MIN_LR       = float(os.environ.get("MIN_LR", "2e-5"))
@@ -209,13 +204,6 @@ else:
     train_texts, train_raw_examples = load_sft_data(SFT_TRAIN_PATH)
     val_texts,   val_raw_examples   = load_sft_data(SFT_VAL_PATH)
 
-if QUICKMODE:
-    train_texts = train_texts[:QUICKMODE_MAX_TRAIN]
-    val_texts   = val_texts[:QUICKMODE_MAX_VAL]
-    if train_raw_examples is not None:
-        train_raw_examples = train_raw_examples[:QUICKMODE_MAX_TRAIN]
-        val_raw_examples   = val_raw_examples[:QUICKMODE_MAX_VAL]
-
 print(f"[data] train={len(train_texts)} val={len(val_texts)}", flush=True)
 
 def _find_assistant_start(full_text, messages):
@@ -252,7 +240,7 @@ def _tokenize_examples(texts, tok, max_len, raw_examples=None):
     return encodings, skipped
 
 def _cache_meta(n_texts, max_len):
-    return {"max_len": max_len, "n_texts": n_texts, "quickmode": QUICKMODE}
+    return {"max_len": max_len, "n_texts": n_texts}
 
 def _load_token_cache(cache_path, n_texts, max_len):
     if not cache_path or not os.path.isfile(cache_path):
