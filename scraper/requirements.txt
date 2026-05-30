@@ -1,0 +1,6 @@
+kaggle
+requests
+beautifulsoup4
+markdownify
+python-dotenv
+playwright

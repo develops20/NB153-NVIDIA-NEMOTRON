@@ -1,0 +1,28 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# OS / IDE
+.DS_Store
+.cursor/
+
+# Large / generated (sync to RunPod or Kaggle separately)
+outputs/
+data/
+logs/
+*.log
+*.pt
+
+# Reference clone — keep locally, don't track in git
+nemotron-master/
+
+# Local diff helpers
+training/train.py.baseline
+training/train.py.diff
