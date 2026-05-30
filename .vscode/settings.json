@@ -1,0 +1,17 @@
+{
+  "files.watcherExclude": {
+    "**/nemotron-master/**": true,
+    "**/venv/**": true,
+    "**/.venv/**": true,
+    "**/outputs/**": true,
+    "**/data/**": true,
+    "**/logs/**": true,
+    "**/__pycache__/**": true
+  },
+  "search.exclude": {
+    "**/nemotron-master": true,
+    "**/venv": true,
+    "**/outputs": true,
+    "**/data": true
+  }
+}

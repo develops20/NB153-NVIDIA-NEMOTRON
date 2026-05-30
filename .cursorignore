@@ -1,0 +1,9 @@
+# Stop Cursor from indexing/watching huge local-only dirs
+nemotron-master/
+venv/
+.venv/
+outputs/
+data/
+logs/
+__pycache__/
+*.pt
