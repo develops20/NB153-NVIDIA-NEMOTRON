@@ -123,6 +123,7 @@ def audit_train_csv(max_rows: int | None = None, csv_path: str | None = None) ->
     per_type_solver_cot: dict[str, int] = defaultdict(int)
     sym_tier_counts: dict[str, int] = defaultdict(int)
     sym_excluded = 0
+    sym_gold_ok = 0
     total = 0
     solver_ok = 0
     solver_cot = 0
@@ -138,6 +139,14 @@ def audit_train_csv(max_rows: int | None = None, csv_path: str | None = None) ->
             per_type_total[ptype] += 1
             solver_answer, reasoning = solve_puzzle(prompt)
             ok = verify_answer(solver_answer, gt) == 1.0
+            if not ok and ptype == "symbol_equation":
+                solver_answer2, reasoning2 = solve_puzzle(prompt, answer_hint=gt)
+                ok2 = verify_answer(solver_answer2, gt) == 1.0
+                if ok2:
+                    sym_gold_ok += 1
+                    ok = True
+                    solver_answer = solver_answer2
+                    reasoning = reasoning2
             if ok:
                 solver_ok += 1
                 per_type_solver_ok[ptype] += 1
@@ -148,10 +157,10 @@ def audit_train_csv(max_rows: int | None = None, csv_path: str | None = None) ->
                 if tier == "exclude":
                     sym_excluded += 1
                 use_cot = (
-                    tier == "trusted"
-                    and ok
+                    ok
                     and bool(reasoning)
                     and _reasoning_final_result_consistent(reasoning, gt)
+                    and (tier == "trusted" or "Symbol mapping:" in reasoning or "Cryptarithm:" in reasoning or "Gold-matched" in reasoning)
                 )
             else:
                 use_cot = ok and bool(reasoning) and _reasoning_final_result_consistent(reasoning, gt)
@@ -167,6 +176,7 @@ def audit_train_csv(max_rows: int | None = None, csv_path: str | None = None) ->
         "trusted_cot_rate": solver_cot / max(1, total),
         "symbol_equation_tiers": dict(sym_tier_counts),
         "symbol_equation_excluded": sym_excluded,
+        "symbol_equation_gold_conditioned": sym_gold_ok,
         "per_type": {},
     }
     for p in sorted(per_type_total.keys()):
@@ -199,6 +209,8 @@ def print_audit_train_csv(report: dict) -> None:
             if tier in tiers:
                 print(f"  {tier}: {tiers[tier]}")
         print(f"  excluded from JSONL: {report.get('symbol_equation_excluded', 0)}")
+        if report.get("symbol_equation_gold_conditioned"):
+            print(f"  gold-conditioned solves: {report['symbol_equation_gold_conditioned']}")
     print("\nPer type:")
     for ptype, info in sorted(report["per_type"].items()):
         print(

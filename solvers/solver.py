@@ -39,7 +39,7 @@ def classify_puzzle(prompt: str) -> str:
     return "symbol_equation"
 
 
-def solve_puzzle(prompt: str) -> tuple[str, str]:
+def solve_puzzle(prompt: str, *, answer_hint: str | None = None) -> tuple[str, str]:
     """Returns (answer, reasoning) for any puzzle type."""
     puzzle_type = classify_puzzle(prompt)
 
@@ -57,7 +57,10 @@ def solve_puzzle(prompt: str) -> tuple[str, str]:
         return "", f"Unknown puzzle type: {puzzle_type}"
 
     try:
-        answer, reasoning = solver(prompt)
+        if puzzle_type == "symbol_equation" and answer_hint is not None:
+            answer, reasoning = solver(prompt, answer_hint=answer_hint)
+        else:
+            answer, reasoning = solver(prompt)
         return answer, reasoning
     except Exception as e:
         return "", f"Solver error ({puzzle_type}): {e}"

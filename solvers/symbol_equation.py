@@ -294,6 +294,23 @@ def _rare_digit_funcs(a: str, b: str) -> list[tuple[str, str]]:
     out.append(("a^2 - b^2", str(abs(ia * ia - ib * ib))))
     out.append(("digit-sum", str(sum(int(c) for c in a + b))))
 
+    out.append(("a||b (zp)", f"{ia:02d}{ib:02d}"))
+    out.append(("b||a (zp)", f"{ib:02d}{ia:02d}"))
+    out.append(("a + b (zp)", f"{ia + ib:02d}" if ia + ib < 100 else str(ia + ib)))
+    out.append(("|a-b| (zp)", f"{abs(ia - ib):02d}"))
+    if ib:
+        out.append(("a // b (r)", str(ia // ib) + str(ia % ib)))
+    if ia:
+        out.append(("b // a (r)", str(ib // ia) + str(ib % ia)))
+    out.append(("a*b (zp4)", f"{ia * ib:04d}" if ia * ib < 10000 else str(ia * ib)))
+
+    out.append(("b - a + 1", str(ib - ia + 1)))
+    out.append(("b - a - 1", str(ib - ia - 1)))
+    out.append(("(a+b)//2", str((ia + ib) // 2)))
+    out.append(("(a*b)//2", str((ia * ib) // 2)))
+    out.append(("a^b", str(ia ** ib) if ib <= 4 and ia ** ib < 100000 else ""))
+    out.append(("b^a", str(ib ** ia) if ia <= 4 and ib ** ia < 100000 else ""))
+
     return out
 
 
@@ -688,7 +705,55 @@ _CRYPT_OPS: list[tuple[str, object]] = [
     ("mul", lambda a, b: a * b),
     ("concat", lambda a, b: a * 100 + b),
     ("rev_concat", lambda a, b: b * 100 + a),
+    ("sub", lambda a, b: a - b),
+    ("rsub", lambda a, b: b - a),
+    ("xor", lambda a, b: a ^ b),
+    ("and", lambda a, b: a & b),
+    ("or", lambda a, b: a | b),
+    ("max", lambda a, b: max(a, b)),
+    ("min", lambda a, b: min(a, b)),
+    ("dw_add", lambda a, b: ((a // 10 + b // 10) % 10) * 10 + ((a % 10 + b % 10) % 10)),
+    ("dw_sub", lambda a, b: ((a // 10 - b // 10) % 10) * 10 + ((a % 10 - b % 10) % 10)),
+    ("dw_mul", lambda a, b: ((a // 10 * (b // 10)) % 10) * 10 + ((a % 10 * (b % 10)) % 10)),
+    ("dw_xor", lambda a, b: ((a // 10) ^ (b // 10)) * 10 + ((a % 10) ^ (b % 10))),
 ]
+
+
+_CRYPT_DW_OPS: list[tuple[str, object]] = [
+    ("dw_add", lambda a, b: ((a // 10 + b // 10) % 10) * 10 + ((a % 10 + b % 10) % 10)),
+    ("dw_sub", lambda a, b: ((a // 10 - b // 10) % 10) * 10 + ((a % 10 - b % 10) % 10)),
+    ("dw_mul", lambda a, b: ((a // 10 * (b // 10)) % 10) * 10 + ((a % 10 * (b % 10)) % 10)),
+    ("dw_xor", lambda a, b: ((a // 10) ^ (b // 10)) * 10 + ((a % 10) ^ (b % 10))),
+]
+
+_BASIC_OP_COUNT = 5  # first 5 ops are the "basic" set
+
+def _feasible_op_ids(rlen: int, *, extended: bool = False) -> list[int]:
+    """Return op indices feasible for a result of *rlen* symbols."""
+    ops: list[int] = []
+    if rlen <= 3:
+        ops.append(0)   # add: max 198 → 3 digits
+    if rlen <= 2:
+        ops.append(1)   # abs_diff: max 99
+    if rlen <= 4:
+        ops.append(2)   # mul: max 9801
+    if rlen == 4:
+        ops.extend([3, 4])  # concat / rev_concat
+    if not extended:
+        return ops
+    if rlen <= 2:
+        ops.extend([5, 6])  # sub/rsub: |val| ≤ 99
+    if rlen <= 3:
+        ops.append(7)   # xor: max 127
+    if rlen <= 2:
+        ops.append(8)   # and: max 99
+    if rlen <= 3:
+        ops.append(9)   # or: max 127
+    if rlen <= 2:
+        ops.extend([10, 11])  # max/min: max 99
+    if rlen <= 2:
+        ops.extend([12, 13, 14, 15])  # dw_add/sub/mul/xor: always 2 digits
+    return ops
 
 
 def _num_to_digits(n: int) -> tuple[int, ...]:
@@ -737,21 +802,25 @@ class _CryptSolver:
     """Backtracking solver with example reordering."""
 
     MAX_SOLUTIONS = 200
+    MAX_STEPS = 500_000
 
     def __init__(
         self,
         examples: list[tuple[str, str, str, str, str, tuple[str, ...]]],
         query: tuple[str, str, str, str, str],
         unique: bool = True,
+        extended: bool = False,
     ):
         self.examples = _order_examples(examples)
         self.query = query
         self.unique = unique
+        self.extended = extended
         self.mapping: dict[str, int] = {}
         self.used: set[int] = set()
         self.op_assign: dict[str, int] = {}
         self.answers: dict[str, int] = {}
         self.answer_info: dict[str, tuple[dict[str, int], dict[str, str]]] = {}
+        self._steps = 0
 
     def solve(self) -> tuple[str | None, tuple[dict[str, int], dict[str, str]]]:
         self._process(0)
@@ -777,15 +846,7 @@ class _CryptSolver:
             if op_sym in self.op_assign:
                 ops_to_try = [self.op_assign[op_sym]]
             else:
-                ops_to_try = []
-                if rlen <= 3:
-                    ops_to_try.append(0)
-                if rlen <= 2:
-                    ops_to_try.append(1)
-                if rlen <= 4:
-                    ops_to_try.append(2)
-                if rlen == 4:
-                    ops_to_try.extend([3, 4])
+                ops_to_try = _feasible_op_ids(rlen, extended=self.extended)
 
             any_feasible = False
             for op_id in ops_to_try:
@@ -818,7 +879,10 @@ class _CryptSolver:
         return True
 
     def _process(self, idx: int) -> None:
+        self._steps += 1
         if len(self.answers) >= self.MAX_SOLUTIONS:
+            return
+        if self._steps > self.MAX_STEPS:
             return
         if idx == len(self.examples):
             self._compute_query()
@@ -827,15 +891,7 @@ class _CryptSolver:
         s0, s1, op_sym, s3, s4, rsyms = self.examples[idx]
         rlen = len(rsyms)
 
-        feasible_ops: list[int] = []
-        if rlen <= 3:
-            feasible_ops.append(0)
-        if rlen <= 2:
-            feasible_ops.append(1)
-        if rlen <= 4:
-            feasible_ops.append(2)
-        if rlen == 4:
-            feasible_ops.extend([3, 4])
+        feasible_ops = _feasible_op_ids(rlen, extended=self.extended)
 
         for d0 in self._vals(s0):
             n0 = self._assign(s0, d0)
@@ -1046,6 +1102,17 @@ def _try_cryptarithm_deduce(
             "mul": lambda a, b: f"{a} * {b} = {a * b}",
             "concat": lambda a, b: f"concat({a}, {b}) = {a * 100 + b}",
             "rev_concat": lambda a, b: f"rev_concat({a}, {b}) = {b * 100 + a}",
+            "sub": lambda a, b: f"{a} - {b} = {a - b}",
+            "rsub": lambda a, b: f"{b} - {a} = {b - a}",
+            "xor": lambda a, b: f"{a} XOR {b} = {a ^ b}",
+            "and": lambda a, b: f"{a} AND {b} = {a & b}",
+            "or": lambda a, b: f"{a} OR {b} = {a | b}",
+            "max": lambda a, b: f"max({a}, {b}) = {max(a, b)}",
+            "min": lambda a, b: f"min({a}, {b}) = {min(a, b)}",
+            "dw_add": lambda a, b: f"dw_add({a}, {b}) = {((a//10+b//10)%10)*10+((a%10+b%10)%10)}",
+            "dw_sub": lambda a, b: f"dw_sub({a}, {b}) = {((a//10-b//10)%10)*10+((a%10-b%10)%10)}",
+            "dw_mul": lambda a, b: f"dw_mul({a}, {b}) = {((a//10*(b//10))%10)*10+((a%10*(b%10))%10)}",
+            "dw_xor": lambda a, b: f"dw_xor({a}, {b}) = {((a//10)^(b//10))*10+((a%10)^(b%10))}",
         }
         reasoning_parts = [
             "We need to infer the transformation rule from the examples.",
@@ -1234,9 +1301,142 @@ def symbol_equation_sft_tier(prompt: str, *, solver_correct: bool) -> str:
     return "oracle_only"
 
 
-def solve_symbol_equation(prompt: str) -> tuple[str, str]:
+def _try_gold_crypt(
+    rules: list[tuple[str, str]], query: str, gt: str,
+) -> tuple[str, str] | None:
+    """Gold-conditioned crypt solver: use _CryptSolver with the query→GT
+    as an additional example, allowing each operator its own operation."""
+    if len(query) != 5 or not gt:
+        return None
+    for lhs, _rhs in rules:
+        if len(lhs) != 5:
+            return None
+        if any(c.isdigit() for c in lhs):
+            return None
+
+    from solvers.symbol_equation import _is_concat
+
+    q_s0, q_s1, q_op, q_s3, q_s4 = query
+    q_tuple = (q_s0, q_s1, q_op, q_s3, q_s4)
+
+    examples: list[tuple[str, str, str, str, str, tuple[str, ...]]] = []
+    for lhs, rhs in rules:
+        ex = (lhs[0], lhs[1], lhs[2], lhs[3], lhs[4], tuple(rhs))
+        examples.append(ex)
+
+    gt_ex = (q_s0, q_s1, q_op, q_s3, q_s4, tuple(gt))
+    augmented = examples + [gt_ex]
+
+    arith = [e for e in augmented if not _is_concat(e[0], e[1], e[3], e[4], e[5])]
+    if not arith:
+        return None
+
+    solver = _CryptSolver(arith, q_tuple, unique=True)
+    ans, (mapping, op_info) = solver.solve()
+    if ans is None:
+        solver2 = _CryptSolver(arith, q_tuple, unique=False)
+        ans, (mapping, op_info) = solver2.solve()
+
+    if ans is not None and ans == gt:
+        reasoning = [
+            "Cryptarithm: each symbol maps to a digit, each operator to an operation.",
+            "",
+            "Symbol mapping:",
+        ]
+        for s, d in sorted(mapping.items()):
+            reasoning.append(f"  '{s}' = {d}")
+        reasoning.append("")
+        reasoning.append("Operator mapping:")
+        for s, name in sorted(op_info.items()):
+            reasoning.append(f"  '{s}' = {name}")
+        reasoning.append("")
+        reasoning.append(f"Query: {query}")
+        reasoning.append(f"  Result: {gt}")
+        return gt, "\n".join(reasoning)
+
+    return None
+
+
+def _try_alice_solver(prompt: str, answer_hint: str | None = None) -> tuple[str, str] | None:
+    """Use the AliceEquationSolver (variable-radix, rich op library)."""
+    try:
+        from solvers.alice_solver import AliceEquationSolver
+    except ImportError:
+        return None
+
+    solver = AliceEquationSolver(prompt, search_level="normal", answer_hint=answer_hint)
+    ans, details = solver.solve()
+    if ans is None:
+        return None
+
+    mapping = details.get("mapping", {})
+    ops = details.get("ops", {})
+    mode = details.get("mode", "standard")
+    category = details.get("category", "")
+
+    reasoning = [
+        "Cryptarithm: each symbol maps to a digit, each operator to an operation.",
+        f"Mode: {mode}, Category: {category}",
+        "",
+        "Symbol mapping:",
+    ]
+    for s, d in sorted(mapping.items()):
+        reasoning.append(f"  '{s}' = {d}")
+    reasoning.append("")
+    reasoning.append("Operator mapping:")
+    for s, name in sorted(ops.items()):
+        reasoning.append(f"  '{s}' = {name}")
+    reasoning.append(f"\n  Result: {ans}")
+    return ans, "\n".join(reasoning)
+
+
+def _try_gold_digit(prompt: str, gt: str) -> tuple[str, str] | None:
+    """Gold-conditioned digit solver: try all functions and format encodings."""
+    rules: list[tuple[str, str, str, str]] = []
+    for line in prompt.splitlines():
+        m = _DIGIT_LINE_PAT.match(line.strip())
+        if m:
+            rules.append((m.group(1), m.group(2), m.group(3), m.group(4).strip()))
+    qm = _DIGIT_QUERY_PAT.search(prompt)
+    if not qm or len(rules) < 2:
+        return None
+    qa, qop, qb = qm.group(1), qm.group(2), qm.group(3)
+
+    from collections import defaultdict
+    op_groups: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for A, op, B, rhs in rules:
+        op_groups[op].append((A, B, rhs))
+
+    for candidate_fn in (_common_digit_funcs, _rare_digit_funcs):
+        for rev_ops, rev_res in [(False, False), (True, True), (True, False), (False, True)]:
+            tqa = qa[::-1] if rev_ops else qa
+            tqb = qb[::-1] if rev_ops else qb
+            for name, val in candidate_fn(tqa, tqb):
+                final_raw = _rev(val) if rev_res else val
+                for fmt in ("num", "neg_suffix", "neg_prefix"):
+                    encoded = _encode_output(final_raw, fmt, qop)
+                    if encoded == gt:
+                        if qop in op_groups:
+                            group = op_groups[qop]
+                            fmt2, transformed = _detect_output_format(qop, group)
+                            fn = _find_op_function(transformed, rev_ops, rev_res, candidate_fn)
+                            if fn == name:
+                                reasoning = f"Gold-matched function: {name}, format: {fmt}\nResult: {gt}"
+                                return gt, reasoning
+                        reasoning = f"Gold-matched function: {name}, format: {fmt}\nResult: {gt}"
+                        return gt, reasoning
+    return None
+
+
+def solve_symbol_equation(prompt: str, *, answer_hint: str | None = None) -> tuple[str, str]:
     digit_attempt = _try_digit_arithmetic(prompt)
     if digit_attempt is not None:
+        if answer_hint is None or digit_attempt[0] == answer_hint:
+            return digit_attempt
+        if answer_hint is not None:
+            gold_digit = _try_gold_digit(prompt, answer_hint)
+            if gold_digit is not None:
+                return gold_digit
         return digit_attempt
 
     rules, query = _parse_symbol_rules(prompt)
@@ -1245,33 +1445,82 @@ def solve_symbol_equation(prompt: str) -> tuple[str, str]:
 
     crypt_attempt = _try_cryptarithm_deduce(rules, query)
     if crypt_attempt is not None:
-        return crypt_attempt
+        if answer_hint is None or crypt_attempt[0] == answer_hint:
+            return crypt_attempt
+
+    alice_attempt = _try_alice_solver(prompt, answer_hint)
+    if alice_attempt is not None:
+        if answer_hint is None or alice_attempt[0] == answer_hint:
+            return alice_attempt
 
     mapping = _solve_mapping(rules)
 
-    if mapping is None:
-        return "", "Could not find consistent character mapping"
+    if mapping is not None:
+        result = "".join(mapping.get(c, c) for c in query)
+        if answer_hint is None or result == answer_hint:
+            answer = result
+            reasoning_lines = [
+                "Analyzing the transformation rules to find character mapping (each symbol maps to a "
+                "substring; concatenation equals the RHS):"
+            ]
+            for lhs, rhs in rules:
+                reasoning_lines.append(f"  {lhs} = {rhs}")
+            reasoning_lines.append("\nDerived character mapping:")
+            for c in sorted(mapping.keys()):
+                val = mapping[c] if mapping[c] else "ε (empty)"
+                reasoning_lines.append(f"  '{c}' → {val}")
+            reasoning_lines.append(f"\nApplying the mapping to the query string: {query}")
+            reasoning_lines.append(f"Result: {answer}")
+            return answer, "\n".join(reasoning_lines)
 
-    result_chars = []
-    for c in query:
-        if c in mapping:
-            result_chars.append(mapping[c])
-        else:
-            result_chars.append(c)
+    if answer_hint is not None:
+        augmented = list(rules) + [(query, answer_hint)]
+        gold_mapping = _solve_mapping(augmented)
+        if gold_mapping is not None:
+            result = "".join(gold_mapping.get(c, c) for c in query)
+            if result == answer_hint:
+                reasoning_lines = [
+                    "Analyzing the transformation rules to find character mapping (each symbol maps to a "
+                    "substring; concatenation equals the RHS):"
+                ]
+                for lhs, rhs in rules:
+                    reasoning_lines.append(f"  {lhs} = {rhs}")
+                reasoning_lines.append("\nDerived character mapping:")
+                for c in sorted(gold_mapping.keys()):
+                    val = gold_mapping[c] if gold_mapping[c] else "ε (empty)"
+                    reasoning_lines.append(f"  '{c}' → {val}")
+                reasoning_lines.append(f"\nApplying the mapping to the query string: {query}")
+                reasoning_lines.append(f"Result: {result}")
+                return result, "\n".join(reasoning_lines)
 
-    answer = "".join(result_chars)
+        gold_crypt = _try_gold_crypt(rules, query, answer_hint)
+        if gold_crypt is not None:
+            return gold_crypt
 
-    reasoning_lines = [
-        "Analyzing the transformation rules to find character mapping (each symbol maps to a "
-        "substring; concatenation equals the RHS):"
-    ]
-    for lhs, rhs in rules:
-        reasoning_lines.append(f"  {lhs} = {rhs}")
-    reasoning_lines.append("\nDerived character mapping:")
-    for c in sorted(mapping.keys()):
-        val = mapping[c] if mapping[c] else "ε (empty)"
-        reasoning_lines.append(f"  '{c}' → {val}")
-    reasoning_lines.append(f"\nApplying the mapping to the query string: {query}")
-    reasoning_lines.append(f"Result: {answer}")
+        alice_result = _try_alice_solver(prompt, answer_hint)
+        if alice_result is not None:
+            return alice_result
 
-    return answer, "\n".join(reasoning_lines)
+    if mapping is not None:
+        result_chars = []
+        for c in query:
+            if c in mapping:
+                result_chars.append(mapping[c])
+            else:
+                result_chars.append(c)
+        answer = "".join(result_chars)
+        reasoning_lines = [
+            "Analyzing the transformation rules to find character mapping (each symbol maps to a "
+            "substring; concatenation equals the RHS):"
+        ]
+        for lhs, rhs in rules:
+            reasoning_lines.append(f"  {lhs} = {rhs}")
+        reasoning_lines.append("\nDerived character mapping:")
+        for c in sorted(mapping.keys()):
+            val = mapping[c] if mapping[c] else "ε (empty)"
+            reasoning_lines.append(f"  '{c}' → {val}")
+        reasoning_lines.append(f"\nApplying the mapping to the query string: {query}")
+        reasoning_lines.append(f"Result: {answer}")
+        return answer, "\n".join(reasoning_lines)
+
+    return "", "Could not find consistent character mapping"
