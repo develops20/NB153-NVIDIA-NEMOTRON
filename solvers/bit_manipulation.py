@@ -10,6 +10,7 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import product as iproduct
 
 MASK = 0xFF
 # Cap inner iterations for two-op search to avoid hangs when many ops match the first pair.
@@ -526,7 +527,6 @@ def _solve_per_bit_legacy(
     best_offset_pair = (
         offset_pair_counts.most_common(1)[0][0] if offset_pair_counts else None
     )
-    # Additional heuristic: count dominant families among confident bits
     family_counts: Counter = Counter()
     for out_bit in range(8):
         if bit_confidence[out_bit] != 2 or bit_preds[out_bit] is None:
@@ -543,7 +543,7 @@ def _solve_per_bit_legacy(
                     family_counts[fid] += 1
                 except ValueError:
                     pass
-            break  # Only count the first (chosen) pred
+            break
 
     for out_bit in range(8):
         if bit_confidence[out_bit] == 2:
@@ -562,7 +562,6 @@ def _solve_per_bit_legacy(
             for name, primary_bit in preds[val]:
                 if primary_bit == expected_input:
                     combined[val] += 3
-                # Simplicity bonus: prefer Identity/NOT over complex functions
                 if name.startswith("bit") and primary_bit == expected_input:
                     combined[val] += 1
                 elif name.startswith("NOT") and primary_bit == expected_input:
@@ -572,7 +571,6 @@ def _solve_per_bit_legacy(
                         fid = int(name.split("(")[0][1:])
                         if fid in best_fn_ids:
                             combined[val] += 2
-                        # Bonus for matching dominant family
                         if fid in family_counts and family_counts[fid] >= 2:
                             combined[val] += 2
                     except ValueError:
@@ -586,7 +584,6 @@ def _solve_per_bit_legacy(
                                 pb2 = int(b_parts[1].strip()[1:])
                                 if pb1 == exp_b1 and pb2 == exp_b2:
                                     combined[val] += 5
-                                # Also try swapped operand pair
                                 elif pb1 == exp_b2 and pb2 == exp_b1:
                                     combined[val] += 3
                         except (ValueError, IndexError):
@@ -602,66 +599,219 @@ def _solve_per_bit_legacy(
             bit_results[out_bit] = 0
             bit_names[out_bit] = preds[0][0][0]
         bit_confidence[out_bit] = 1
-    for out_bit in range(8):
-        if bit_results[out_bit] is not None:
-            continue
-        out_vals = [(out >> out_bit) & 1 for _, out in examples]
-        found_3 = False
-        preds_3: dict[int, list[str]] = {0: [], 1: []}
-        for b1 in range(8):
-            for b2 in range(b1 + 1, 8):
-                for b3 in range(b2 + 1, 8):
-                    for fn_id in range(256):
-                        ok = True
-                        for i in range(n):
-                            idx = (
-                                in_bits_arr[b1][i] * 4
-                                + in_bits_arr[b2][i] * 2
-                                + in_bits_arr[b3][i]
-                            )
-                            if ((fn_id >> idx) & 1) != out_vals[i]:
-                                ok = False
-                                break
-                        if ok:
-                            idx_q = (
-                                ((query >> b1) & 1) * 4
-                                + ((query >> b2) & 1) * 2
-                                + ((query >> b3) & 1)
-                            )
-                            val = (fn_id >> idx_q) & 1
-                            preds_3[val].append(
-                                f"f3_{fn_id}(b{b1},b{b2},b{b3})"
-                            )
-                            found_3 = True
-        if not found_3:
-            return None
-        has_0 = len(preds_3[0]) > 0
-        has_1 = len(preds_3[1]) > 0
-        if has_0 and not has_1:
-            bit_results[out_bit] = 0
-            bit_names[out_bit] = preds_3[0][0]
-        elif has_1 and not has_0:
-            bit_results[out_bit] = 1
-            bit_names[out_bit] = preds_3[1][0]
-        elif has_0 and has_1:
-            bit_results[out_bit] = (
-                1 if len(preds_3[1]) >= len(preds_3[0]) else 0
-            )
-            bit_names[out_bit] = (
-                preds_3[1] if bit_results[out_bit] else preds_3[0]
-            )[0]
-        else:
-            return None
+
+    # 3-input with cross-bit consistency
+    bits_needing_3: list[int] = [b for b in range(8) if bit_results[b] is None]
+    if bits_needing_3:
+        cands_3: list[list[tuple[int, int, tuple, tuple]]] = [[] for _ in range(8)]
+        for out_bit in bits_needing_3:
+            out_vals = [(out >> out_bit) & 1 for _, out in examples]
+            for b1 in range(8):
+                for b2 in range(b1 + 1, 8):
+                    for b3 in range(b2 + 1, 8):
+                        for fn_id in range(256):
+                            ok = True
+                            for i in range(n):
+                                idx = (in_bits_arr[b1][i] * 4 +
+                                       in_bits_arr[b2][i] * 2 +
+                                       in_bits_arr[b3][i])
+                                if ((fn_id >> idx) & 1) != out_vals[i]:
+                                    ok = False
+                                    break
+                            if ok:
+                                idx_q = (((query >> b1) & 1) * 4 +
+                                         ((query >> b2) & 1) * 2 +
+                                         ((query >> b3) & 1))
+                                val = (fn_id >> idx_q) & 1
+                                rel = ((b1 - out_bit) % 8,
+                                       (b2 - out_bit) % 8,
+                                       (b3 - out_bit) % 8)
+                                cands_3[out_bit].append((val, fn_id, (b1, b2, b3), rel))
+
+        for out_bit in bits_needing_3:
+            if not cands_3[out_bit]:
+                return None
+
+        for out_bit in bits_needing_3:
+            vals = {c[0] for c in cands_3[out_bit]}
+            if len(vals) == 1:
+                bit_results[out_bit] = cands_3[out_bit][0][0]
+                bit_names[out_bit] = "f3(confident)"
+
+        still_ambig = [b for b in bits_needing_3 if bit_results[b] is None]
+        if still_ambig:
+            # Collect ALL (fn_id, rel) patterns that appear for ANY 3-input bit
+            all_patterns: Counter = Counter()
+            for out_bit in bits_needing_3:
+                seen: set = set()
+                for v, fn_id, inputs, rel in cands_3[out_bit]:
+                    key = (fn_id, rel)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    all_patterns[key] += 1
+
+            # Also extract dominant offset from resolved 1/2-input bits
+            offset_from_12: Counter = Counter()
+            for out_bit in range(8):
+                if out_bit in bits_needing_3 or bit_results[out_bit] is None:
+                    continue
+                if bit_preds[out_bit] is None:
+                    continue
+                val = bit_results[out_bit]
+                for name, primary_bit in bit_preds[out_bit][val]:
+                    if primary_bit >= 0:
+                        offset_from_12[(primary_bit - out_bit) % 8] += 1
+                    break
+
+            best_12_offset = offset_from_12.most_common(1)[0][0] if offset_from_12 else None
+
+            # Try patterns covering ALL ambiguous bits, prioritized by:
+            # 1. Higher coverage count
+            # 2. Offset consistency with resolved bits
+            ranked_patterns = []
+            for (fn_id, rel), cnt in all_patterns.most_common():
+                covers_all = True
+                for b in still_ambig:
+                    found = False
+                    for v, fid, inp, r in cands_3[b]:
+                        if fid == fn_id and r == rel:
+                            found = True
+                            break
+                    if not found:
+                        covers_all = False
+                        break
+                if not covers_all:
+                    continue
+
+                # Bonus for offset consistency with 1/2-input bits
+                offset_bonus = 0
+                if best_12_offset is not None and best_12_offset in rel:
+                    offset_bonus = 10
+                ranked_patterns.append((cnt * 10 + offset_bonus, fn_id, rel))
+
+            ranked_patterns.sort(reverse=True)
+
+            resolved = False
+            for score, fn_id, rel in ranked_patterns:
+                fill: dict[int, int] = {}
+                rule_map: dict[int, tuple] = {}
+                for b in bits_needing_3:
+                    for v, fid, inp_bits, r in cands_3[b]:
+                        if fid == fn_id and r == rel:
+                            fill[b] = v
+                            rule_map[b] = inp_bits
+                            break
+                    if b not in fill:
+                        if bit_results[b] is not None:
+                            fill[b] = bit_results[b]
+                        else:
+                            break
+
+                if len(fill) < len(bits_needing_3):
+                    continue
+
+                test_results = list(bit_results)
+                for b, v in fill.items():
+                    if test_results[b] is None:
+                        test_results[b] = v
+                if any(r is None for r in test_results):
+                    continue
+
+                ok = True
+                for inp, out in examples:
+                    v = 0
+                    for i in range(8):
+                        if i in rule_map:
+                            b1, b2, b3 = rule_map[i]
+                            idx = (((inp >> b1) & 1) * 4 +
+                                   ((inp >> b2) & 1) * 2 +
+                                   ((inp >> b3) & 1))
+                            v |= ((fn_id >> idx) & 1) << i
+                        else:
+                            v |= _eval_legacy_bit(in_bits_arr, inp, query,
+                                                  bit_preds[i], bit_results[i], i) << i
+                    if v != (out & MASK):
+                        ok = False
+                        break
+                if ok:
+                    for b in still_ambig:
+                        if b in fill:
+                            bit_results[b] = fill[b]
+                            bit_names[b] = f"f3_{fn_id}"
+                    resolved = True
+                    break
+
+            if not resolved:
+                # LOO-based fallback for remaining ambiguous 3-input bits
+                sa2 = [b for b in still_ambig if bit_results[b] is None]
+                for out_bit in sa2:
+                    out_vals = [(out >> out_bit) & 1 for _, out in examples]
+                    loo_score = {0: 0, 1: 0}
+                    for hold_out in range(n):
+                        tv = [out_vals[i] for i in range(n) if i != hold_out]
+                        tb = [[in_bits_arr[b][i] for i in range(n) if i != hold_out] for b in range(8)]
+                        nt = n - 1
+                        hi = examples[hold_out][0]
+                        ht = out_vals[hold_out]
+                        for b1 in range(8):
+                            for b2 in range(b1 + 1, 8):
+                                for b3 in range(b2 + 1, 8):
+                                    for fn_id in range(256):
+                                        ok2 = True
+                                        for i2 in range(nt):
+                                            idx2 = tb[b1][i2]*4 + tb[b2][i2]*2 + tb[b3][i2]
+                                            if ((fn_id >> idx2) & 1) != tv[i2]:
+                                                ok2 = False
+                                                break
+                                        if ok2:
+                                            idx_h = (((hi>>b1)&1)*4+((hi>>b2)&1)*2+((hi>>b3)&1))
+                                            pred = (fn_id >> idx_h) & 1
+                                            if pred == ht:
+                                                loo_score[pred] += 1
+                    if loo_score[0] != loo_score[1]:
+                        bit_results[out_bit] = 0 if loo_score[0] > loo_score[1] else 1
+                    else:
+                        vals_0 = sum(1 for c in cands_3[out_bit] if c[0] == 0)
+                        vals_1 = sum(1 for c in cands_3[out_bit] if c[0] == 1)
+                        bit_results[out_bit] = 1 if vals_1 >= vals_0 else 0
+                    bit_names[out_bit] = "f3(loo)"
+
     if any(b is None for b in bit_results):
         return None
     result = sum(b << i for i, b in enumerate(bit_results))  # type: ignore
-    parts = ["Per-bit analysis (legacy heuristic + 3-input if needed):"]
+    parts = ["Per-bit analysis (legacy heuristic + 3-input):"]
     for i in range(8):
         parts.append(
             f"  Output bit {i} = {bit_names[i]} → {bit_results[i]}"
         )
     parts.append(f"Result: {result:08b}")
     return f"{result:08b}", "\n".join(parts)
+
+
+def _eval_legacy_bit(in_bits_arr, inp, query, preds, result_val, out_bit):
+    """Evaluate legacy per-bit result on a specific input."""
+    if preds is None:
+        return result_val
+    val = result_val
+    for name, primary_bit in preds[val]:
+        if name.startswith("const"):
+            return val
+        if name.startswith("bit"):
+            return (inp >> primary_bit) & 1
+        if name.startswith("NOT"):
+            return 1 - ((inp >> primary_bit) & 1)
+        if name.startswith("f") and "(" in name:
+            fn_part = name.split("(")[0]
+            fn_id = int(fn_part[1:])
+            bits_part = name.split("(")[1].rstrip(")")
+            b_parts = bits_part.split(",")
+            b1 = int(b_parts[0].strip()[1:])
+            b2 = int(b_parts[1].strip()[1:])
+            idx = ((inp >> b1) & 1) * 2 + ((inp >> b2) & 1)
+            return (fn_id >> idx) & 1
+        break
+    return result_val
 
 
 def _rule_complexity(rule: _RuleCandidate) -> int:
@@ -986,13 +1136,92 @@ def _solve_per_bit_stride(examples: list[tuple[int, int]], query: int) -> tuple[
     return answer, "\n".join(lines)
 
 
+def _solve_structured_search(
+    examples: list[tuple[int, int]], query: int
+) -> tuple[str, str] | None:
+    """Structured search: shared base_offset + per-bit fn_id with fixed or variable delta."""
+    n = len(examples)
+
+    best_result: str | None = None
+    best_score = -1
+
+    for base_offset in range(8):
+        for delta in range(1, 8):
+            valid_fn_ids = [set() for _ in range(8)]
+            for out_bit in range(8):
+                b1 = (out_bit + base_offset) % 8
+                b2 = (out_bit + base_offset + delta) % 8
+                for fn_id in range(16):
+                    ok = True
+                    for inp, out in examples:
+                        idx = ((inp >> b1) & 1) * 2 + ((inp >> b2) & 1)
+                        if (fn_id >> idx) & 1 != ((out >> out_bit) & 1):
+                            ok = False
+                            break
+                    if ok:
+                        valid_fn_ids[out_bit].add(fn_id)
+
+            if not all(valid_fn_ids[b] for b in range(8)):
+                continue
+
+            fn_freq: Counter = Counter()
+            for b in range(8):
+                for fid in valid_fn_ids[b]:
+                    fn_freq[fid] += 1
+
+            for pool_size in range(1, 5):
+                top_fns = [f for f, _ in fn_freq.most_common(pool_size)]
+                pool = set(top_fns)
+                restricted = [valid_fn_ids[b] & pool for b in range(8)]
+                if not all(restricted[b] for b in range(8)):
+                    continue
+
+                options = [sorted(restricted[b]) for b in range(8)]
+                space = 1
+                for o in options:
+                    space *= len(o)
+                if space > 10000:
+                    continue
+
+                for assignment in iproduct(*options):
+                    ok = True
+                    for inp, out in examples:
+                        v = 0
+                        for out_bit in range(8):
+                            b1 = (out_bit + base_offset) % 8
+                            b2 = (out_bit + base_offset + delta) % 8
+                            idx = ((inp >> b1) & 1) * 2 + ((inp >> b2) & 1)
+                            v |= ((assignment[out_bit] >> idx) & 1) << out_bit
+                        if v != (out & MASK):
+                            ok = False
+                            break
+                    if ok:
+                        result = 0
+                        for out_bit in range(8):
+                            b1 = (out_bit + base_offset) % 8
+                            b2 = (out_bit + base_offset + delta) % 8
+                            idx = ((query >> b1) & 1) * 2 + ((query >> b2) & 1)
+                            result |= ((assignment[out_bit] >> idx) & 1) << out_bit
+                        a_score = 100 - len(set(assignment)) * 10 - pool_size
+                        if a_score > best_score:
+                            best_score = a_score
+                            best_result = f"{result:08b}"
+
+    if best_result is not None:
+        return best_result, "Structured search"
+    return None
+
+
 def _solve_per_bit(
     examples: list[tuple[int, int]], query: int
 ) -> tuple[str, str] | None:
-    """Stride heuristic first; validated search if stride fails; legacy last."""
+    """Stride first; structured search; validated search; legacy last."""
     stride = _solve_per_bit_stride(examples, query)
     if stride is not None:
         return stride
+    structured = _solve_structured_search(examples, query)
+    if structured is not None:
+        return structured
     search = _solve_per_bit_search(examples, query)
     if search is not None:
         return search
