@@ -78,7 +78,7 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     device_map={"": 0},
     trust_remote_code=True,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 if tokenizer.pad_token is None:
