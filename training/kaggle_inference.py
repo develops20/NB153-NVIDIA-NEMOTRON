@@ -1,7 +1,12 @@
 import os, shutil, subprocess
 
-#ADAPTER_PATH = "/kaggle/input/datasets/nicholas33/nemotron-sft-adapter-v1"
-ADAPTER_PATH = "/kaggle/input/models/nicholas33/nemotron-sft-adapter-v2/pytorch/nemotron-sft-adapter-run2-valloss0369/1"
+# Set ADAPTER_PATH to your Kaggle Models input after uploading the GRPO adapter.
+# Run2 SFT (0.74 LB):  .../nemotron-sft-adapter-run2-valloss0369/1
+# GRPO v1 (target):    .../nemotron-sft-adapter-grpo-v1/1  (update after RunPod GRPO)
+ADAPTER_PATH = os.environ.get(
+    "ADAPTER_PATH",
+    "/kaggle/input/models/nicholas33/nemotron-sft-adapter-v2/pytorch/nemotron-sft-adapter-run2-valloss0369/1",
+)
 OUTPUT_DIR = "/kaggle/working"
 
 # Copy the two adapter files into /kaggle/working

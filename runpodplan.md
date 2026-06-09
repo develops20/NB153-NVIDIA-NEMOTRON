@@ -538,4 +538,73 @@ python -u train.py 2>&1 | tee logs/train_$(date +%Y%m%d_%H%M).log
 
 ---
 
-*Updated after Run 2 — Blackwell CUDA 12.8 + torch cu128 + mamba rebuild sequence. Key fix: pin `mamba_ssm==2.3.1` with `--no-deps` to prevent it from swapping torch to cu130. Run 2 result: val_loss 0.0369 on 15,569 clean examples, ~18.2h.*
+*Updated after Run 2 — Blackwell CUDA 12.8 + torch cu128 + mamba rebuild sequence. Key fix: pin `mamba_ssm==2.3.1` with `--no-deps` to prevent it from swapping torch to cu130. Run 2 result: val_loss 0.0369 on 15,569 clean examples, ~18.2h. Public LB: **0.74** (SFT plateau — see section 14 for GRPO).*
+
+---
+
+## 14. GRPO stage (after SFT — target 0.80+)
+
+SFT alone plateaued at **public LB 0.74**. GRPO continues from the SFT adapter with verifiable rewards via [training/grpo_train.py](training/grpo_train.py).
+
+### Prerequisites
+
+- SFT adapter at `/workspace/output/` (run2: val_loss 0.0369, fingerprint `079d43f8f2f4bfd3edf351f84917d52d`)
+- `data/sft_train.jsonl` on pod
+- Upload: `grpo_train.py`, `solvers/`, `trl_wheels/trl-0.29.1-py3-none-any.whl`
+
+### Install TRL on pod
+
+```bash
+pip install /workspace/trl_wheels/trl-0.29.1-py3-none-any.whl
+pip install datasets
+```
+
+### Smoke test (~5 min)
+
+```bash
+export SFT_ADAPTER=/workspace/output
+export OUTPUT_DIR=/workspace/output_grpo_smoke
+export DATA_DIR=/workspace/data
+export GRPO_MAX_ROWS=10
+export GRPO_MAX_STEPS=2
+python -u /workspace/grpo_train.py
+```
+
+### Full GRPO run (~8–12h)
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export SFT_ADAPTER=/workspace/output
+export OUTPUT_DIR=/workspace/output_grpo
+export DATA_DIR=/workspace/data
+unset GRPO_MAX_ROWS GRPO_MAX_STEPS
+
+tmux new -s grpo
+python -u /workspace/grpo_train.py 2>&1 | tee logs/grpo_$(date +%Y%m%d_%H%M).log
+```
+
+### Fingerprint + download
+
+```bash
+python3 -c "
+import hashlib, sys
+f=sys.argv[1]
+with open(f,'rb') as fh:
+    fh.seek(0); a=fh.read(5_000_000)
+    fh.seek(1_000_000_000); b=fh.read(5_000_000)
+print(hashlib.md5(a+b).hexdigest(), f)
+" /workspace/output_grpo/adapter_model.safetensors
+# Must differ from run2: 079d43f8f2f4bfd3edf351f84917d52d
+
+scp root@POD:/workspace/output_grpo/submission.zip .
+```
+
+### Submit on Kaggle
+
+1. Upload adapter to Kaggle Models (`nemotron-sft-adapter-grpo-v1`)
+2. Run [training/kaggle_inference.py](training/kaggle_inference.py) with `ADAPTER_PATH` set
+3. Submit `submission.zip` (5/day limit)
+
+See [evaluation/GRPO_ITERATION.md](evaluation/GRPO_ITERATION.md) if score stays below 0.82.
+

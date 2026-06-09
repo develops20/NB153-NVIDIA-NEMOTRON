@@ -1,12 +1,12 @@
 # NVIDIA Nemotron Model Reasoning Challenge — Competition Plan
 
-**Last updated:** 2026-05-29 (from live scrape in `scraper/competition-data/`)
+**Last updated:** 2026-06-09
 
 **Deadline:** 2026-06-15 (final submission) | **Entry / team merge:** 2026-06-08  
 **Prize pool:** $106,388 + 8× DGX Spark systems  
-**Public leaderboard bar (May 2026):** ~**0.86** on Models tab; community threads on breaking the **0.86 ceiling**; notebook titles cite **0.87** experiments  
-**Our validated pipeline score:** **0.50** (end-to-end SFT submit); **next focus:** solver accuracy → better SFT/GRPO data  
-**Stretch target:** competitive with top public (~0.86+), not necessarily 0.95+ on private LB  
+**Public leaderboard bar:** ~**0.86–0.89** on Models tab  
+**Our SFT score:** **0.74** (run2 adapter, val_loss 0.0369) — **next: GRPO** via `training/grpo_train.py`  
+**Stretch target:** 0.86+ with GRPO; 0.89 is top-tier
 
 **Participation (Kaggle, May 2026):** 3,644 teams · 16,313 entrants · 49,441 submissions · **1,020** public-scored notebooks  
 
@@ -21,8 +21,9 @@
 | `data/sft_train.jsonl`, `data/sft_val.jsonl` | Generated SFT dataset |
 | `solvers/` | Deterministic puzzle solvers (accuracy work in progress) |
 | `data_generation/generate_sft_data.py` | Synthetic CoT + audits |
-| `training/kaggle_notebook.py` | Kaggle training notebook (cells) |
-| `training/train.py` | RunPod / local training |
+| `training/grpo_train.py` | RunPod GRPO (after SFT) |
+| `training/train.py` | RunPod SFT |
+| `training/kaggle_inference.py` | Package submission.zip for Kaggle |
 | `evaluation/evaluate.py` | Local metric + `--audit-solvers` / `--audit-sft` |
 
 Refresh competition intel: `cd scraper && python competitionscraper.py nvidia-nemotron-model-reasoning-challenge`
@@ -237,13 +238,13 @@ You are a systematic reasoning assistant. Analyze the puzzle carefully, identify
 | Phase | Milestone | Target | Status |
 |-------|-----------|--------|--------|
 | Done | SFT JSONL pipeline, Kaggle/RunPod training scripts, submission packaging | — | **Done** |
-| Done | End-to-end scored submit (SFT-only) | **0.50** | **Done** |
-| **Now** | **Fix solvers** (`symbol_equation`, `bit_manipulation`); re-audit `raw-data/train.csv` | Solver audits → high 90s%+ overall | **In progress** |
-| Next | Regenerate / refresh SFT with trusted CoT only; optional GRPO on Kaggle or RunPod | Beat 0.50 → toward **0.70+** then **0.86** public bar | Pending |
+| Done | End-to-end scored submit (SFT-only) | **0.74** | **Done** |
+| **Now** | **GRPO from run2 SFT checkpoint** (`training/grpo_train.py`) | **0.80+** target | **Next** |
+| Next | Submit GRPO adapter; iterate if below 0.82 | Toward **0.86** public bar | Pending |
 | Jun 8 | Entry deadline (accept rules, merge teams) | — | Upcoming |
 | Jun 8–15 | Final adapter + **public notebook + write-up** (required for prizes) | Best effort LB | Upcoming |
 
-> **~17 days to competition end (per overview scrape).** Prioritize solver fixes before another long training run.
+> **~6 days to competition end.** Prioritize GRPO from run2 SFT checkpoint; see `runpodplan.md` section 14.
 
 ---
 
@@ -268,11 +269,12 @@ project/
 │   ├── sft_train.jsonl
 │   └── sft_val.jsonl
 ├── training/
-│   ├── kaggle_notebook.py   # Kaggle GPU notebook
+│   ├── grpo_train.py        # RunPod GRPO
 │   ├── train.py             # RunPod SFT
-│   └── kaggle_inference.py
+│   └── kaggle_inference.py  # submission.zip packaging
 ├── evaluation/
-│   └── evaluate.py
+│   ├── evaluate.py
+│   └── GRPO_ITERATION.md
 └── outputs/                 # Adapters, logs, submission artifacts
 ```
 

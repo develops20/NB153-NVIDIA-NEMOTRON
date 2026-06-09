@@ -1,0 +1,15 @@
+{
+  "note": "Solver-only upper bound on raw-data/train.csv via evaluation/evaluate.py --solver-only",
+  "overall_accuracy": 0.9267,
+  "overall_correct": 8804,
+  "overall_total": 9500,
+  "per_type": {
+    "bit_manipulation": {"accuracy": 0.9307, "correct": 1491, "total": 1602},
+    "cipher": {"accuracy": 1.0, "correct": 1576, "total": 1576},
+    "gravity": {"accuracy": 1.0, "correct": 1597, "total": 1597},
+    "roman_numeral": {"accuracy": 1.0, "correct": 1576, "total": 1576},
+    "symbol_equation": {"accuracy": 0.6238, "correct": 970, "total": 1555},
+    "unit_conversion": {"accuracy": 1.0, "correct": 1594, "total": 1594}
+  },
+  "model_eval_note": "Run on RunPod GPU: python evaluation/evaluate.py --adapter outputs/run2 --csv raw-data/train.csv --max-samples 200"
+}

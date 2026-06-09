@@ -8,13 +8,16 @@ import argparse
 import csv
 import json
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from collections import defaultdict
-from solvers.solver import classify_puzzle
+from solvers.solver import (
+    classify_puzzle,
+    extract_boxed_answer,
+    verify_answer,
+)
 
 # Match training / SFT system prompt (evaluation/inference fidelity).
 SYSTEM_PROMPT = (
@@ -23,29 +26,6 @@ SYSTEM_PROMPT = (
     "step by step inside <think>...</think> tags, and always place your final "
     "answer inside \\boxed{}. Do not include \\boxed{} anywhere else in your response."
 )
-
-
-def extract_boxed_answer(text: str) -> str | None:
-    """Extract the LAST \\boxed{} answer from model output (matches competition metric)."""
-    matches = re.findall(r"\\boxed\{([^}]*)\}", text)
-    return matches[-1].strip() if matches else None
-
-
-def verify_answer(predicted: str, ground_truth: str) -> float:
-    """1.0 for exact match or float within 1e-2 relative tolerance, else 0.0."""
-    if predicted is None:
-        return 0.0
-    if predicted.strip() == ground_truth.strip():
-        return 1.0
-    try:
-        pred_f = float(predicted)
-        gt_f = float(ground_truth)
-        if abs(gt_f) < 1e-9:
-            return 1.0 if abs(pred_f) < 1e-9 else 0.0
-        rel_diff = abs(pred_f - gt_f) / (abs(gt_f) + 1e-9)
-        return 1.0 if rel_diff < 0.01 else 0.0
-    except (ValueError, TypeError):
-        return 0.0
 
 
 def evaluate_predictions(predictions: list[dict]) -> dict:
@@ -61,7 +41,7 @@ def evaluate_predictions(predictions: list[dict]) -> dict:
         predicted = extract_boxed_answer(model_output)
 
         puzzle_type = classify_puzzle(prompt)
-        score = verify_answer(predicted, ground_truth)
+        score = verify_answer(predicted or "", ground_truth)
 
         per_type[puzzle_type]["total"] += 1
         overall_total += 1
@@ -171,19 +151,26 @@ def _run_inference(predictions: list[dict], adapter_path: str) -> list[dict]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
 
-    print(f"Loading base model...")
-    base_model_path = "/kaggle/input/nemotron-3-nano-30b-a3b-bf16"
+    base_model_path = os.environ.get(
+        "MODEL_PATH",
+        "/workspace/.cache/kagglehub/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1",
+    )
     if not os.path.exists(base_model_path):
-        import kagglehub
-        base_model_path = kagglehub.model_download(
-            "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
-        )
+        kaggle_path = "/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"
+        if os.path.exists(kaggle_path):
+            base_model_path = kaggle_path
+        else:
+            import kagglehub
+            base_model_path = kagglehub.model_download(
+                "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
+            )
 
+    print(f"Loading base model from {base_model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_path, trust_remote_code=True
@@ -230,10 +217,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate Nemotron reasoning adapter")
     parser.add_argument(
         "--csv",
-        default=os.path.join(
-            os.path.dirname(__file__), "..",
-            "competition-data", "nvidia-nemotron-model-reasoning-challenge", "train.csv",
-        ),
+        default=os.path.join(os.path.dirname(__file__), "..", "raw-data", "train.csv"),
         help="Path to evaluation CSV",
     )
     parser.add_argument(
@@ -256,7 +240,16 @@ def main():
         action="store_true",
         help="Phase 0: solver accuracy & trusted-CoT stats on --csv (no GPU/model).",
     )
-    parser.add_argument("--adapter", default=None, help="Path to LoRA adapter directory")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to LoRA adapter directory (adapter_config.json + adapter_model.safetensors)",
+    )
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Write evaluation results JSON to this path",
+    )
     parser.add_argument("--max-samples", type=int, default=None, help="Limit number of samples")
     parser.add_argument(
         "--solver-only", action="store_true",
@@ -280,7 +273,11 @@ def main():
     if args.solver_only:
         args.adapter = None
 
-    evaluate_from_csv(args.csv, args.adapter, args.max_samples)
+    results = evaluate_from_csv(args.csv, args.adapter, args.max_samples)
+    if args.output_json:
+        with open(args.output_json, "w") as out:
+            json.dump(results, out, indent=2)
+        print(f"\nWrote results to {args.output_json}")
 
 
 if __name__ == "__main__":
