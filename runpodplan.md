@@ -2,9 +2,11 @@
 
 Follow this **before** starting the GPU. Goal: configure once, then run ~17h training without wasting GPU hours.
 
-Prior successful run: **RTX PRO 6000 Blackwell 96 GB**, val_loss **0.0388**, ~**17.5h**, peak VRAM **~94/96 GB**.
+Prior successful runs (RTX PRO 6000 Blackwell 96 GB):
+- **Run 1:** val_loss **0.0328**, ~**17.5h**, 14,608 train examples, peak VRAM ~94/96 GB. (LR decayed to ~0 → train-loss NaN tail at end; cosmetic.)
+- **Run 2:** val_loss **0.0369**, ~**18.2h**, 15,569 train / 1,730 val, peak VRAM ~90/96 GB. (Cosine LR floored at 2e-5 → no NaN tail; cleaner data, 0 drops.)
 
-**Current SFT data (Jun 2):** 17,299 examples — 0 fallbacks, 0 mismatches, 98.58% solver accuracy on train.csv.
+**Current SFT data:** 15,569 train / 1,730 val examples — 0 fallbacks, 0 mismatches at load time, ~98.6% solver accuracy on train.csv. (If you regenerate the data, update the counts in section 1, section 7 expected-log, and the env note below.)
 
 ---
 
@@ -83,8 +85,10 @@ The base RunPod image ships **nvcc 12.4**, but Nemotron on Blackwell needs:
 | CUDA toolkit (nvcc) | **12.8** (V12.8.93) |
 | torch | **2.12.0.dev+cu128** (nightly) |
 | causal_conv1d | **1.6.1** (built from git) |
-| mamba_ssm | **2.3.1** (built from pip) |
-| torch archs | `sm_75`, `sm_80`, `sm_86`, `sm_90`, `sm_100`, **`sm_120`** |
+| mamba_ssm | **2.3.1** (built from pip, **pinned + `--no-deps`** — see warning below) |
+| torch archs | `sm_75`, `sm_80`, `sm_90`, `sm_100`, **`sm_120`** |
+
+> ⚠️ **Critical — mamba_ssm can hijack your torch.** Newer mamba_ssm (e.g. `2.3.2.post1`) declares dependencies (`nvidia-cutlass-dsl`, `tilelang`, `quack-kernels`) that **uninstall your cu128 nightly torch and replace it with cu130 stable + a CUDA 13 stack**. `--no-build-isolation` does **not** prevent this (it only affects the build env, not runtime deps). Always install mamba as `pip install mamba_ssm==2.3.1 --no-deps --no-build-isolation` and verify torch is unchanged afterward. See section 3.3.
 
 Plain `pip install causal-conv1d mamba-ssm` on the stock image **will fail** on Blackwell. Follow section 3 exactly.
 
@@ -206,6 +210,8 @@ archs ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
 
 **Must run in the same shell** where CUDA env vars are set (section 3.1).
 
+> ⚠️ Use `--no-deps` on both, and **pin `mamba_ssm==2.3.1`**. Without this, mamba_ssm's dependency tree will silently uninstall your cu128 nightly torch and pull in cu130 + a CUDA 13 stack, breaking the verified Blackwell setup.
+
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=$CUDA_HOME/bin:$PATH
@@ -213,13 +219,25 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export FORCE_CUDA=1
 export TORCH_CUDA_ARCH_LIST="12.0+PTX"
 
+# Runtime deps that --no-deps would otherwise skip (safe to pre-install)
+pip install einops ninja
+
 pip uninstall -y causal_conv1d mamba_ssm
 
 # causal_conv1d — pinned, ~5 min build
-pip install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.6.1 --no-build-isolation
+pip install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.6.1 --no-build-isolation --no-deps
 
-# mamba_ssm — latest on pip, ~10 min build
-pip install mamba_ssm --no-build-isolation
+# mamba_ssm — PINNED to 2.3.1 + --no-deps so it can't swap your torch, ~10 min build
+pip install mamba_ssm==2.3.1 --no-build-isolation --no-deps
+```
+
+**Immediately verify torch was NOT replaced:**
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.version.cuda)"
+# MUST still show: 2.12.0.dev...+cu128   12.8
+# If it shows +cu130 or a CUDA 13 version, mamba pulled the wrong deps —
+# reinstall torch (section 3.2) and redo this step with --no-deps.
 ```
 
 Expected versions:
@@ -228,6 +246,8 @@ Expected versions:
 |---------|---------|
 | causal_conv1d | 1.6.1 |
 | mamba_ssm | 2.3.1 |
+
+> **Note from Run 2:** if you forget `--no-deps` and end up on `mamba_ssm 2.3.2.post1` + torch `2.12.0+cu130`, training *can* still succeed (the cu130 stable torch happened to be ABI-compatible with the kernels and supports sm_120). But this is not guaranteed — stay on the pinned cu128 stack for reproducibility.
 
 ### 3.4 Remaining Python packages
 
@@ -258,9 +278,9 @@ Pin if needed: `pip install transformers==5.8.0 peft==0.19.1`
 |------|-----|
 | **CUDA toolkit major must match torch build** | `+cu128` torch → CUDA **12.8** nvcc. `+cu124` torch → CUDA **12.4** nvcc. |
 | **`TORCH_CUDA_ARCH_LIST="12.0+PTX"`** | Blackwell-specific. Without it, mamba_ssm build may pick wrong archs and fail. |
-| **`--no-build-isolation`** | Required for both mamba packages — otherwise pip builds in a clean env without your installed torch. |
+| **`--no-build-isolation` + `--no-deps`** | `--no-build-isolation` lets the build see your installed torch. `--no-deps` stops mamba_ssm from uninstalling your cu128 torch and pulling cu130 + CUDA 13. **Use both on causal_conv1d and mamba_ssm.** Pin `mamba_ssm==2.3.1`. |
 | **`FORCE_CUDA=1`** | Forces CUDA kernel compilation even if GPU isn't detected at build time. |
-| **Order: CUDA → torch → mamba** | Each step depends on the previous. **Reinstalling torch requires rebuilding causal_conv1d + mamba_ssm.** |
+| **Order: CUDA → torch → mamba** | Each step depends on the previous. **Reinstalling torch requires rebuilding causal_conv1d + mamba_ssm.** Always verify `torch.__version__` still shows `+cu128` after the mamba step. |
 
 ---
 
@@ -450,6 +470,7 @@ scp -r root@POD_IP:/workspace/output/checkpoints/best ./checkpoints_best/
 |-------|-----|
 | `ModuleNotFoundError: solvers` | Copy `/workspace/solvers/`; run from `/workspace` |
 | `ModuleNotFoundError: mamba_ssm` | Re-run section 3.3 with CUDA env vars + `TORCH_CUDA_ARCH_LIST="12.0+PTX"` |
+| **mamba install replaced torch / pulled cu130** | mamba_ssm 2.3.2+ deps uninstall cu128 torch. Reinstall torch (section 3.2), then `pip install mamba_ssm==2.3.1 --no-deps --no-build-isolation`. Verify: `python -c "import torch;print(torch.__version__)"` must show `+cu128`. |
 | `no kernel image` / CUDA arch mismatch | Wrong torch for Blackwell — use cu128 nightly (section 3.2) |
 | mamba build fails | Check `nvcc --version` is 12.8; use `--no-build-isolation`; set `FORCE_CUDA=1` |
 | Reinstalled torch, mamba broken | Must rebuild causal_conv1d + mamba_ssm (section 3.3) |
@@ -481,11 +502,14 @@ nvcc --version
 pip uninstall -y torch torchvision torchaudio
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 
-# 3. Mamba (rebuild against new torch)
+# 3. Mamba (rebuild against new torch — PIN + --no-deps so it can't swap your torch)
 export TORCH_CUDA_ARCH_LIST="12.0+PTX"
+pip install einops ninja
 pip uninstall -y causal_conv1d mamba_ssm
-pip install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.6.1 --no-build-isolation
-pip install mamba_ssm --no-build-isolation
+pip install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.6.1 --no-build-isolation --no-deps
+pip install mamba_ssm==2.3.1 --no-build-isolation --no-deps
+# VERIFY torch unchanged (must still be +cu128):
+python3 -c "import torch; print(torch.__version__, torch.version.cuda)"
 
 # 4. Other deps (no bitsandbytes — train.py uses native bf16)
 pip install -U pip polars peft transformers accelerate kagglehub safetensors sentencepiece protobuf
@@ -514,4 +538,4 @@ python -u train.py 2>&1 | tee logs/train_$(date +%Y%m%d_%H%M).log
 
 ---
 
-*Updated Jun 2 — Blackwell CUDA 12.8 + torch cu128 + mamba rebuild sequence verified on RTX PRO 6000.*
+*Updated after Run 2 — Blackwell CUDA 12.8 + torch cu128 + mamba rebuild sequence. Key fix: pin `mamba_ssm==2.3.1` with `--no-deps` to prevent it from swapping torch to cu130. Run 2 result: val_loss 0.0369 on 15,569 clean examples, ~18.2h.*
