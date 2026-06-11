@@ -8,7 +8,12 @@ echo "Uploading GRPO scripts to $POD ..."
 scp "$ROOT/training/grpo_train.py" "$POD:/workspace/grpo_train.py"
 scp -r "$ROOT/solvers" "$POD:/workspace/solvers"
 scp "$ROOT/trl_wheels/trl-0.29.1-py3-none-any.whl" "$POD:/workspace/trl_wheels/trl-0.29.1-py3-none-any.whl"
+# Required: ground-truth answers are embedded in assistant messages (\\boxed{...})
 scp "$ROOT/data/sft_train.jsonl" "$POD:/workspace/data/sft_train.jsonl"
+# Optional: only needed to regenerate JSONL on pod (generate_sft_data.py), not for grpo_train.py
+if [[ -f "$ROOT/raw-data/train.csv" ]]; then
+  scp "$ROOT/raw-data/train.csv" "$POD:/workspace/data/train.csv"
+fi
 
 echo "Done. On pod run:"
 echo "  pip install /workspace/trl_wheels/trl-0.29.1-py3-none-any.whl datasets"

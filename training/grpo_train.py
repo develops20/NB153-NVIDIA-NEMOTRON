@@ -7,7 +7,8 @@ Continues from an SFT LoRA checkpoint and optimizes with verifiable rewards
 
 Prerequisites:
   - SFT adapter at SFT_ADAPTER (adapter_config.json + adapter_model.safetensors)
-  - sft_train.jsonl in DATA_DIR (prompt + ground-truth answers)
+  - sft_train.jsonl in DATA_DIR — ground truth comes from assistant \\boxed{} in each row
+    (NOT from train.csv; CSV was consumed at JSONL generation time)
   - trl==0.29.1 (pip install trl_wheels/trl-0.29.1-py3-none-any.whl)
   - Same CUDA 12.8 + torch cu128 + mamba stack as train.py
 

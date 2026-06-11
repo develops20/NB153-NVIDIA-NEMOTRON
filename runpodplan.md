@@ -24,7 +24,8 @@ Prior successful runs (RTX PRO 6000 Blackwell 96 GB):
 
 ### B. Upload from Mac (before or right after pod start)
 
-- [ ] `data/sft_train.jsonl` → `/workspace/data/` (15,569 rows — **NOT `sft-0.74/`**)
+- [ ] `data/sft_train.jsonl` → `/workspace/data/` (**required for GRPO — contains ground-truth `\boxed{}` answers**)
+- [ ] `raw-data/train.csv` → `/workspace/data/train.csv` (**optional** — only if regenerating JSONL on pod)
 - [ ] `data/sft_val.jsonl` → `/workspace/data/` (1,730 rows)
 - [ ] Copy `training/train.py` + entire `solvers/` folder → `/workspace/`
 
@@ -35,6 +36,7 @@ Prior successful runs (RTX PRO 6000 Blackwell 96 GB):
 - [ ] **Step 1:** Install CUDA 12.8 toolkit + set env vars (section 3.1)
 - [ ] **Step 2:** Install PyTorch nightly cu128 (section 3.2)
 - [ ] **Step 3:** Rebuild `causal_conv1d` + `mamba_ssm` against new torch (section 3.3)
+- [ ] **Step 4:** Pin Triton to 3.6.0 (section 3.5 — **required** on Blackwell)
 - [ ] Install remaining Python deps (section 3.4)
 - [ ] Download base model via `kagglehub` (section 4)
 - [ ] Mamba2 smoke test + import checks (section 5)
@@ -86,6 +88,7 @@ The base RunPod image ships **nvcc 12.4**, but Nemotron on Blackwell needs:
 | torch | **2.12.0.dev+cu128** (nightly) |
 | causal_conv1d | **1.6.1** (built from git) |
 | mamba_ssm | **2.3.1** (built from pip, **pinned + `--no-deps`** — see warning below) |
+| triton | **3.6.0** (pin required — torch nightly pulls 3.7.0 which breaks sm_120; section 3.5) |
 | torch archs | `sm_75`, `sm_80`, `sm_90`, `sm_100`, **`sm_120`** |
 
 > ⚠️ **Critical — mamba_ssm can hijack your torch.** Newer mamba_ssm (e.g. `2.3.2.post1`) declares dependencies (`nvidia-cutlass-dsl`, `tilelang`, `quack-kernels`) that **uninstall your cu128 nightly torch and replace it with cu130 stable + a CUDA 13 stack**. `--no-build-isolation` does **not** prevent this (it only affects the build env, not runtime deps). Always install mamba as `pip install mamba_ssm==2.3.1 --no-deps --no-build-isolation` and verify torch is unchanged afterward. See section 3.3.
@@ -272,6 +275,23 @@ pip uninstall -y bitsandbytes
 
 Pin if needed: `pip install transformers==5.8.0 peft==0.19.1`
 
+### 3.5 Pin Triton to Blackwell-working version (REQUIRED)
+
+The torch nightly pulls in `triton 3.7.0`, which fails on sm_120 (Blackwell) with
+`RuntimeError: Triton Error [CUDA]: device kernel image is invalid` during the first
+mamba kernel launch. Pin to 3.6.0 (proven working on RTX 6000 Blackwell):
+
+```bash
+pip install "triton==3.6.0"
+rm -rf ~/.triton/cache
+```
+
+Ignore the pip warning that torch "requires triton==3.7.0" — the override is intentional.
+
+Verify with the Mamba2 smoke test (section 5) — must print `Mamba2 layer OK, output shape (2, 128, 256)`.
+
+> **Note:** Triton 3.7.x may ship in newer torch nightlies ~5 days after a given rebuild. Always run section 3.5 after installing torch (3.2) and mamba (3.3), even on a pod that worked before.
+
 ### Key things to remember
 
 | Rule | Why |
@@ -280,7 +300,8 @@ Pin if needed: `pip install transformers==5.8.0 peft==0.19.1`
 | **`TORCH_CUDA_ARCH_LIST="12.0+PTX"`** | Blackwell-specific. Without it, mamba_ssm build may pick wrong archs and fail. |
 | **`--no-build-isolation` + `--no-deps`** | `--no-build-isolation` lets the build see your installed torch. `--no-deps` stops mamba_ssm from uninstalling your cu128 torch and pulling cu130 + CUDA 13. **Use both on causal_conv1d and mamba_ssm.** Pin `mamba_ssm==2.3.1`. |
 | **`FORCE_CUDA=1`** | Forces CUDA kernel compilation even if GPU isn't detected at build time. |
-| **Order: CUDA → torch → mamba** | Each step depends on the previous. **Reinstalling torch requires rebuilding causal_conv1d + mamba_ssm.** Always verify `torch.__version__` still shows `+cu128` after the mamba step. |
+| **Order: CUDA → torch → mamba → triton pin** | Each step depends on the previous. **Reinstalling torch requires rebuilding causal_conv1d + mamba_ssm and re-pinning triton (3.5).** Always verify `torch.__version__` still shows `+cu128` after the mamba step. |
+| **Pin `triton==3.6.0`** | Torch nightly may pull 3.7.0, which breaks mamba on sm_120. Clear `~/.triton/cache` after pinning. |
 
 ---
 
@@ -469,6 +490,7 @@ scp -r root@POD_IP:/workspace/output/checkpoints/best ./checkpoints_best/
 | Error | Fix |
 |-------|-----|
 | `ModuleNotFoundError: solvers` | Copy `/workspace/solvers/`; run from `/workspace` |
+| `Triton Error [CUDA]: device kernel image is invalid` | Pin `triton==3.6.0`, `rm -rf ~/.triton/cache`, re-run Mamba2 smoke test (sections 3.5 + 5) |
 | `ModuleNotFoundError: mamba_ssm` | Re-run section 3.3 with CUDA env vars + `TORCH_CUDA_ARCH_LIST="12.0+PTX"` |
 | **mamba install replaced torch / pulled cu130** | mamba_ssm 2.3.2+ deps uninstall cu128 torch. Reinstall torch (section 3.2), then `pip install mamba_ssm==2.3.1 --no-deps --no-build-isolation`. Verify: `python -c "import torch;print(torch.__version__)"` must show `+cu128`. |
 | `no kernel image` / CUDA arch mismatch | Wrong torch for Blackwell — use cu128 nightly (section 3.2) |
@@ -511,6 +533,10 @@ pip install mamba_ssm==2.3.1 --no-build-isolation --no-deps
 # VERIFY torch unchanged (must still be +cu128):
 python3 -c "import torch; print(torch.__version__, torch.version.cuda)"
 
+# 3b. Pin Triton (REQUIRED — 3.7.0 breaks sm_120 mamba kernels)
+pip install "triton==3.6.0"
+rm -rf ~/.triton/cache
+
 # 4. Other deps (no bitsandbytes — train.py uses native bf16)
 pip install -U pip polars peft transformers accelerate kagglehub safetensors sentencepiece protobuf
 pip uninstall -y bitsandbytes   # optional: silence libnvJitLink warning at LoRA init
@@ -549,8 +575,26 @@ SFT alone plateaued at **public LB 0.74**. GRPO continues from the SFT adapter w
 ### Prerequisites
 
 - SFT adapter at `/workspace/output/` (run2: val_loss 0.0369, fingerprint `079d43f8f2f4bfd3edf351f84917d52d`)
-- `data/sft_train.jsonl` on pod
+- **`data/sft_train.jsonl` on pod** — this is where GRPO ground-truth lives (see below)
 - Upload: `grpo_train.py`, `solvers/`, `trl_wheels/trl-0.29.1-py3-none-any.whl`
+
+#### GRPO data: `sft_train.jsonl` vs `train.csv`
+
+| File | Required for GRPO? | Why |
+|------|-------------------|-----|
+| **`sft_train.jsonl`** | **YES** | `grpo_train.py` reads each row's assistant `\boxed{…}` as `ground_truth` for `reward_correctness`. |
+| **`train.csv`** | **No** (for running GRPO) | Answers were already copied into JSONL when you ran `generate_sft_data.py`. GRPO never opens `train.csv`. |
+| **`train.csv`** | Optional | Only if you want to **regenerate** JSONL on the pod (`generate_sft_data.py`) or run solver audits. |
+
+We did not list `train.csv` in the upload script because the current GRPO path is JSONL-only — not because GT is optional. If `sft_train.jsonl` is missing, GRPO fails; `train.csv` alone is not enough.
+
+```bash
+# Required upload (includes embedded ground truth)
+scp data/sft_train.jsonl root@POD:/workspace/data/
+
+# Optional — only for regen/audit on pod
+scp raw-data/train.csv root@POD:/workspace/data/train.csv
+```
 
 ### Install TRL on pod
 
