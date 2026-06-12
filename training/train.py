@@ -60,13 +60,23 @@ from solvers.solver import extract_boxed_answer, reasoning_result_matches
 # ─── Hyperparameters ───────────────────────────────────────────────────
 LORA_RANK    = 32
 MAX_SEQ_LEN  = 2048
-NUM_EPOCHS   = int(os.environ.get("NUM_EPOCHS", "2"))
+NUM_EPOCHS   = int(os.environ.get("NUM_EPOCHS", "1"))
 GRAD_ACCUM   = int(os.environ.get("GRAD_ACCUM", "4"))
 LR           = float(os.environ.get("LR", "2e-4"))
-MIN_LR       = float(os.environ.get("MIN_LR", "2e-5"))
+MIN_LR       = float(os.environ.get("MIN_LR", str(LR * 0.1)))  # cosine floor = 10% of peak
 BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", "2"))
 WARMUP_RATIO = 0.05
 MIN_LR_RATIO = MIN_LR / LR
+WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
+LABEL_SMOOTHING = float(os.environ.get("LABEL_SMOOTHING", "0.1"))
+TARGET_VAL_LOSS = float(os.environ.get("TARGET_VAL_LOSS", "0.0"))  # 0 = disabled; stop on entropy, not loss
+EARLY_STOP_PATIENCE = int(os.environ.get("EARLY_STOP_PATIENCE", "2"))
+ENTROPY_VAL_SAMPLES = int(os.environ.get("ENTROPY_VAL_SAMPLES", "4"))
+ENTROPY_MAX_NEW_TOKENS = int(os.environ.get("ENTROPY_MAX_NEW_TOKENS", "128"))
+ENTROPY_TEMPERATURE = float(os.environ.get("ENTROPY_TEMPERATURE", "1.0"))
+EVAL_EVERY_STEPS = int(os.environ.get("EVAL_EVERY_STEPS", "50"))
+MIN_ENTROPY = float(os.environ.get("MIN_ENTROPY", "0.5"))
+GOOD_ENTROPY = float(os.environ.get("GOOD_ENTROPY", "1.0"))
 NUM_WORKERS  = int(os.environ.get("NUM_WORKERS", "4"))
 PIN_MEMORY   = torch.cuda.is_available()
 TOKEN_CACHE  = os.environ.get("TOKEN_CACHE", "")  # dir for pre-tokenized .pt caches; empty = disabled
@@ -311,12 +321,69 @@ train_loader = DataLoader(train_dataset, shuffle=True,  **_loader_kw)
 val_loader   = DataLoader(val_dataset,   shuffle=False, **_loader_kw)
 print(f"[loader] batch={BATCH_SIZE} workers={NUM_WORKERS} pin_memory={PIN_MEMORY}", flush=True)
 
+def _build_entropy_val_prompts(raw_examples, texts, n_samples):
+    n = min(n_samples, len(texts))
+    if n == 0:
+        return []
+    step = max(1, len(texts) // n)
+    prompts = []
+    for i in range(0, len(texts), step):
+        if len(prompts) >= n:
+            break
+        if raw_examples and i < len(raw_examples):
+            msgs = raw_examples[i]["messages"]
+            prompts.append(
+                tokenizer.apply_chat_template(msgs[:2], tokenize=False, add_generation_prompt=True)
+            )
+        else:
+            off = _find_assistant_start(texts[i], None)
+            prompts.append(texts[i][:off] if off > 0 else texts[i])
+    return prompts
+
+entropy_val_prompts = _build_entropy_val_prompts(val_raw_examples, val_texts, ENTROPY_VAL_SAMPLES)
+
 del train_texts, val_texts, train_raw_examples, val_raw_examples
 gc.collect()
 
+_sft_ce = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=LABEL_SMOOTHING)
+
+def _sft_loss(logits, labels):
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return _sft_ce(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    )
+
+@torch.no_grad()
+def _mean_token_entropy(
+    prompts,
+    temperature=ENTROPY_TEMPERATURE,
+    max_new_tokens=ENTROPY_MAX_NEW_TOKENS,
+):
+    """Mean per-token distribution entropy along a sampled rollout (do_sample=True)."""
+    if not prompts:
+        return float("nan")
+    entropies = []
+    for prompt in prompts:
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN)
+        input_ids = enc["input_ids"].to(model.device)
+        for _ in range(max_new_tokens):
+            logits = model(input_ids).logits[:, -1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            entropies.append(-(probs * log_probs).sum(dim=-1).item())
+            next_token = torch.multinomial(probs, num_samples=1)
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+    return sum(entropies) / len(entropies)
+
 # ─── Optimizer + scheduler ─────────────────────────────────────────────
 model.train()
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=0.01)
+optimizer = torch.optim.AdamW(
+    filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=WEIGHT_DECAY,
+)
 
 steps_per_epoch = math.ceil(len(train_loader) / GRAD_ACCUM)
 total_steps = steps_per_epoch * NUM_EPOCHS
@@ -343,18 +410,23 @@ if resume_state:
 
 print(
     f"[train] {NUM_EPOCHS} epochs, ~{total_steps} optimizer steps, warmup={warmup_steps} | "
-    f"lr {LR:.0e}→{MIN_LR:.0e} cosine floor",
+    f"lr {LR:.0e}→{MIN_LR:.0e} ({MIN_LR_RATIO:.0%} floor) | wd={WEIGHT_DECAY} | "
+    f"label_smoothing={LABEL_SMOOTHING} | early_stop target={TARGET_VAL_LOSS} patience={EARLY_STOP_PATIENCE} | "
+    f"eval_every={EVAL_EVERY_STEPS} min_entropy={MIN_ENTROPY} good_entropy={GOOD_ENTROPY}",
     flush=True,
 )
 
 # ─── Checkpointing helpers ─────────────────────────────────────────────
-def save_checkpoint(global_step, epoch, val_loss=None, tag=None):
+def save_checkpoint(global_step, epoch, val_loss=None, tag=None, extra_state=None):
     name = tag or f"step_{global_step}"
     path = os.path.join(CHECKPOINT_DIR, name)
     os.makedirs(path, exist_ok=True)
     model.save_pretrained(path)
+    state = {"global_step": global_step, "epoch": epoch, "val_loss": val_loss}
+    if extra_state:
+        state.update(extra_state)
     with open(os.path.join(path, "trainer_state.json"), "w") as f:
-        json.dump({"global_step": global_step, "epoch": epoch, "val_loss": val_loss}, f)
+        json.dump(state, f)
     print(f"[ckpt] saved {path}", flush=True)
     # Prune old step_* checkpoints, keep best/ and final/
     if KEEP_LAST_N > 0:
@@ -373,11 +445,83 @@ def save_checkpoint(global_step, epoch, val_loss=None, tag=None):
 
 # ─── Training loop ─────────────────────────────────────────────────────
 best_val_loss = float("inf")
+best_healthy_val_loss = float("inf")
+epochs_without_improvement = 0
+if resume_state:
+    best_val_loss = resume_state.get("best_val_loss", best_val_loss)
+    best_healthy_val_loss = resume_state.get("best_healthy_val_loss", best_healthy_val_loss)
+    epochs_without_improvement = resume_state.get("epochs_without_improvement", 0)
 _t0 = time.time()
 global_step = start_global_step
 
 def _to_device(batch):
     return {k: v.to(model.device, non_blocking=PIN_MEMORY) for k, v in batch.items()}
+
+def _compute_val_metrics():
+    val_total = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = _to_device(batch)
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            ).logits
+            vloss = _sft_loss(logits, batch["labels"])
+            if torch.isfinite(vloss):
+                val_total += vloss.item()
+    return val_total / max(1, len(val_loader)), _mean_token_entropy(entropy_val_prompts)
+
+def _run_eval(global_step, epoch, *, at_epoch_end=False):
+    """Validate, log entropy, save best, return (should_stop, reason)."""
+    global best_val_loss, best_healthy_val_loss, epochs_without_improvement
+    avg_val_loss, avg_entropy = _compute_val_metrics()
+    print(
+        f"[eval] val_loss={avg_val_loss:.4f} entropy={avg_entropy:.4f} "
+        f"(sampled T={ENTROPY_TEMPERATURE})",
+        flush=True,
+    )
+    val_improved = avg_val_loss < best_val_loss
+    if val_improved:
+        best_val_loss = avg_val_loss
+        if at_epoch_end:
+            epochs_without_improvement = 0
+    elif at_epoch_end:
+        epochs_without_improvement += 1
+
+    _early_state = {
+        "best_val_loss": best_val_loss,
+        "best_healthy_val_loss": best_healthy_val_loss,
+        "epochs_without_improvement": epochs_without_improvement,
+    }
+    if avg_entropy >= GOOD_ENTROPY and avg_val_loss < best_healthy_val_loss:
+        best_healthy_val_loss = avg_val_loss
+        _early_state["best_healthy_val_loss"] = best_healthy_val_loss
+        save_checkpoint(
+            global_step, epoch + 1 if at_epoch_end else epoch,
+            avg_val_loss, tag="best", extra_state=_early_state,
+        )
+        model.save_pretrained(OUTPUT_DIR)
+        print(
+            f"[best] healthy checkpoint val_loss={avg_val_loss:.4f} "
+            f"entropy={avg_entropy:.4f} → {OUTPUT_DIR}",
+            flush=True,
+        )
+    elif val_improved and avg_entropy < GOOD_ENTROPY:
+        print(
+            f"[best] skipped: val_loss={avg_val_loss:.4f} improved but "
+            f"entropy={avg_entropy:.4f} < good {GOOD_ENTROPY}",
+            flush=True,
+        )
+
+    if avg_entropy < MIN_ENTROPY:
+        return True, f"entropy {avg_entropy:.4f} < floor {MIN_ENTROPY}"
+    if TARGET_VAL_LOSS > 0 and avg_val_loss <= TARGET_VAL_LOSS:
+        return True, f"val_loss {avg_val_loss:.4f} <= target {TARGET_VAL_LOSS}"
+    if at_epoch_end and epochs_without_improvement >= EARLY_STOP_PATIENCE:
+        return True, f"no val improvement for {EARLY_STOP_PATIENCE} epoch(s)"
+    return False, None
+
+stop_training = False
 
 for epoch in range(start_epoch, NUM_EPOCHS):
     model.train()
@@ -390,8 +534,11 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     for i, batch in enumerate(train_loader):
         batch = _to_device(batch)
-        outputs = model(**batch)
-        batch_loss = outputs.loss
+        outputs = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+        batch_loss = _sft_loss(outputs.logits, batch["labels"])
 
         if torch.isfinite(batch_loss):
             (batch_loss / GRAD_ACCUM).backward()
@@ -426,7 +573,31 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 )
 
             if SAVE_EVERY_STEPS and global_step % SAVE_EVERY_STEPS == 0:
-                save_checkpoint(global_step, epoch)
+                save_checkpoint(
+                    global_step, epoch,
+                    extra_state={
+                        "best_val_loss": best_val_loss,
+                        "best_healthy_val_loss": best_healthy_val_loss,
+                        "epochs_without_improvement": epochs_without_improvement,
+                    },
+                )
+
+            if EVAL_EVERY_STEPS and global_step % EVAL_EVERY_STEPS == 0:
+                model.eval()
+                should_stop, stop_reason = _run_eval(global_step, epoch)
+                model.train()
+                gc.collect()
+                torch.cuda.empty_cache()
+                if should_stop:
+                    print(f"[early_stop] {stop_reason}", flush=True)
+                    stop_training = True
+                    break
+
+        if stop_training:
+            break
+
+    if stop_training:
+        break
 
     # Flush remaining grads at epoch end
     if micro_in_accum > 0:
@@ -440,35 +611,31 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         print(f"[epoch {epoch+1}] skipped {nonfinite_skipped} non-finite batches", flush=True)
     avg_train_loss = running_loss / max(1, finite_batches)
 
-    # Validation
+    print(f"[epoch {epoch+1}] train_loss {avg_train_loss:.4f}", flush=True)
     model.eval()
-    val_total = 0.0
-    with torch.no_grad():
-        for batch in val_loader:
-            batch = _to_device(batch)
-            vloss = model(**batch).loss
-            if torch.isfinite(vloss):
-                val_total += vloss.item()
-    avg_val_loss = val_total / max(1, len(val_loader))
-
-    print(f"[epoch {epoch+1}] train_loss {avg_train_loss:.4f} | val_loss {avg_val_loss:.4f}", flush=True)
-
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        save_checkpoint(global_step, epoch + 1, avg_val_loss, tag="best")
-        # Also save to OUTPUT_DIR for the final adapter
-        model.save_pretrained(OUTPUT_DIR)
-        print(f"[best] new best val_loss={best_val_loss:.4f} → {OUTPUT_DIR}", flush=True)
+    should_stop, stop_reason = _run_eval(global_step, epoch, at_epoch_end=True)
+    model.train()
+    if should_stop:
+        print(f"[early_stop] {stop_reason}", flush=True)
+        break
 
     gc.collect()
     torch.cuda.empty_cache()
 
 # ─── Final save + verify ───────────────────────────────────────────────
-if best_val_loss == float("inf"):
+if best_healthy_val_loss == float("inf"):
     model.save_pretrained(OUTPUT_DIR)
-    print(f"[final] no val improvement — saved current adapter to {OUTPUT_DIR}", flush=True)
+    print(
+        f"[final] no healthy checkpoint (entropy >= {GOOD_ENTROPY}) — "
+        f"saved current adapter to {OUTPUT_DIR}",
+        flush=True,
+    )
 else:
-    print(f"[final] using best checkpoint (val_loss={best_val_loss:.4f})", flush=True)
+    print(
+        f"[final] using best healthy checkpoint "
+        f"(val_loss={best_healthy_val_loss:.4f}, entropy >= {GOOD_ENTROPY})",
+        flush=True,
+    )
 
 cfg_path = os.path.join(OUTPUT_DIR, "adapter_config.json")
 with open(cfg_path) as cf:
