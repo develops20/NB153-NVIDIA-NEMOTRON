@@ -867,13 +867,60 @@ def _box_merged(chars: list[str]) -> str:
     return f"\u3010{''.join(chars)}\u3011"
 
 
-def gen_concatenation(n: int = 1500) -> list[dict]:
+# Varied rationale for the bracket-processing generators. A fixed one-liner repeated
+# thousands of times reinforces low-entropy/deterministic generation (the collapse this
+# round is trying to avoid), so we compose the trace from rng-chosen fragments plus the
+# example's actual content \u2014 no two traces share a skeleton.
+_PROC_OPENERS = [
+    "Reading the sample input/output pairs to infer the rule.",
+    "Comparing each sample input with its output reveals the pattern.",
+    "From the worked examples, the transformation is clear.",
+    "Let me work out the rule from the demonstrations.",
+    "Inspecting how each sample maps to its output:",
+    "Lining up inputs against outputs to see what changes:",
+]
+_PROC_RULE = {
+    "merge": [
+        "Every symbol that was wrapped in its own \u3010\u2026\u3011 is collected into a single shared \u3010\u2026\u3011.",
+        "The individual single-symbol brackets are concatenated into one bracket around the whole run.",
+        "All the separate \u3010x\u3011 pieces on a line fuse into one \u3010\u2026\u3011 holding the same symbols in order.",
+    ],
+    "split": [
+        "A single \u3010\u2026\u3011 holding several symbols is broken apart so each symbol gets its own \u3010\u2026\u3011.",
+        "The merged bracket is expanded into one bracket per character.",
+        "Each symbol inside the \u3010\u2026\u3011 is re-wrapped individually, preserving order.",
+    ],
+    "strip": [
+        "The leading space inside the \u3010\u2026\u3011 is removed; everything else is left untouched.",
+        "Each entry simply loses the single space that follows the opening \u3010.",
+        "Only the space right after \u3010 is dropped; the symbols and the closing \u3011 stay as-is.",
+    ],
+}
+_PROC_CLOSERS = [
+    "The same rule applies to all {n} rows; the full mapping is below.",
+    "Applying this uniformly across the {n} rows yields the answer.",
+    "Each of the {n} rows is handled the same way to produce the result.",
+    "Repeating this for every one of the {n} rows gives the output.",
+]
+
+
+def _processing_reasoning(rng, kind: str, demo_in: str, demo_out: str, n_rows: int) -> str:
+    parts = [
+        rng.choice(_PROC_OPENERS),
+        rng.choice(_PROC_RULE[kind]),
+        f"For example, {demo_in} -> {demo_out}.",
+        rng.choice(_PROC_CLOSERS).format(n=n_rows),
+    ]
+    return "\n".join(parts)
+
+
+def gen_concatenation(n: int = 600) -> list[dict]:
     """Merge individually-bracketed symbols into one bracket.
     Trains the model on symbol merging/concatenation fundamentals.
     """
     rng = random.Random(99)
     examples = []
-    lines_per = 100
+    lines_per = 20  # was 100 — keep each example well under MAX_SEQ_LEN=2048 tokens
     demo_lines = 3
 
     for i in range(n):
@@ -900,23 +947,21 @@ def gen_concatenation(n: int = 1500) -> list[dict]:
         )
         answer = "\n".join(test_answers)
 
-        reasoning = (
-            "The rule merges individually-bracketed symbols into a single bracket.\n"
-            f"For example: {demo_pairs[0][0]} -> {demo_pairs[0][1]}\n"
-            "Apply this to each row."
+        reasoning = _processing_reasoning(
+            rng, "merge", demo_pairs[0][0], demo_pairs[0][1], lines_per
         )
         examples.append(make_message(prompt, answer, reasoning))
 
     return examples
 
 
-def gen_splitting(n: int = 1500) -> list[dict]:
+def gen_splitting(n: int = 600) -> list[dict]:
     """Split a single bracket into individually-bracketed symbols.
     Reverse of concatenation — trains symbol-level awareness.
     """
     rng = random.Random(77)
     examples = []
-    lines_per = 100
+    lines_per = 20  # was 100 — keep each example well under MAX_SEQ_LEN=2048 tokens
     demo_lines = 3
 
     for i in range(n):
@@ -943,23 +988,21 @@ def gen_splitting(n: int = 1500) -> list[dict]:
         )
         answer = "\n".join(test_answers)
 
-        reasoning = (
-            "The rule splits a merged bracket into individual character brackets.\n"
-            f"For example: {demo_pairs[0][0]} -> {demo_pairs[0][1]}\n"
-            "Apply this to each row."
+        reasoning = _processing_reasoning(
+            rng, "split", demo_pairs[0][0], demo_pairs[0][1], lines_per
         )
         examples.append(make_message(prompt, answer, reasoning))
 
     return examples
 
 
-def gen_lstrip(n: int = 300) -> list[dict]:
+def gen_lstrip(n: int = 200) -> list[dict]:
     """Strip leading space from a bracketed symbol string.
     Trains precise symbol boundary handling.
     """
     rng = random.Random(91)
     examples = []
-    lines_per = 100
+    lines_per = 20  # was 100 — keep each example well under MAX_SEQ_LEN=2048 tokens
     demo_lines = 3
 
     def _entry():
@@ -987,10 +1030,8 @@ def gen_lstrip(n: int = 300) -> list[dict]:
         )
         answer = "\n".join(test_answers)
 
-        reasoning = (
-            "The rule strips the leading space from the bracketed text.\n"
-            f"For example: {demo_pairs[0][0]} -> {demo_pairs[0][1]}\n"
-            "Apply this to each row."
+        reasoning = _processing_reasoning(
+            rng, "strip", demo_pairs[0][0], demo_pairs[0][1], lines_per
         )
         examples.append(make_message(prompt, answer, reasoning))
 
@@ -1049,9 +1090,11 @@ def main() -> None:
     gen_counts = {
         "bit_manipulation_perbit": 750,
         "symbol_equation_digit": 750,
-        "sym_concatenation": 1500,
-        "sym_splitting": 1500,
-        "sym_lstrip": 300,
+        # Down-weighted from 1500/1500/300: these short, highly-templated bracket tasks
+        # were ~19% of train and reinforced low-entropy generation (W2). Now ~9%.
+        "sym_concatenation": 600,
+        "sym_splitting": 600,
+        "sym_lstrip": 200,
     }
     default_n = 500
     for name, gen in generators:

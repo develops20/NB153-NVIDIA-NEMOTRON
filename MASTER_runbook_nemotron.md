@@ -218,7 +218,7 @@ export EARLY_STOP_PATIENCE=2
 export GOOD_ENTROPY=1.0             # only SAVE checkpoints with entropy >= this
 export MIN_ENTROPY=0.5              # STOP (collapse alarm) if entropy drops below this
 export TARGET_VAL_LOSS=0.0          # DISABLE loss-target stop; we stop on entropy, not loss
-export ENTROPY_VAL_SAMPLES=4
+export ENTROPY_VAL_SAMPLES=16     # was 4 — too few prompts made the entropy gate noisy
 export ENTROPY_MAX_NEW_TOKENS=128
 export ENTROPY_TEMPERATURE=1.0
 

@@ -71,7 +71,7 @@ WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
 LABEL_SMOOTHING = float(os.environ.get("LABEL_SMOOTHING", "0.1"))
 TARGET_VAL_LOSS = float(os.environ.get("TARGET_VAL_LOSS", "0.0"))  # 0 = disabled; stop on entropy, not loss
 EARLY_STOP_PATIENCE = int(os.environ.get("EARLY_STOP_PATIENCE", "2"))
-ENTROPY_VAL_SAMPLES = int(os.environ.get("ENTROPY_VAL_SAMPLES", "4"))
+ENTROPY_VAL_SAMPLES = int(os.environ.get("ENTROPY_VAL_SAMPLES", "16"))  # 4 was too noisy a gate
 ENTROPY_MAX_NEW_TOKENS = int(os.environ.get("ENTROPY_MAX_NEW_TOKENS", "128"))
 ENTROPY_TEMPERATURE = float(os.environ.get("ENTROPY_TEMPERATURE", "1.0"))
 EVAL_EVERY_STEPS = int(os.environ.get("EVAL_EVERY_STEPS", "50"))
