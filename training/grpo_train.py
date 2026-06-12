@@ -9,7 +9,8 @@ Prerequisites:
   - SFT adapter at SFT_ADAPTER (adapter_config.json + adapter_model.safetensors)
   - sft_train.jsonl in DATA_DIR — ground truth comes from assistant \\boxed{} in each row
     (NOT from train.csv; CSV was consumed at JSONL generation time)
-  - trl==0.29.1 (pip install trl_wheels/trl-0.29.1-py3-none-any.whl)
+  - trl 1.4 (pip install "trl>=1.4,<1.5") — matches the transformers 5.x used for SFT;
+    the old trl-0.29.1 wheel is stale (predates transformers 5) and is NOT used here
   - Same CUDA 12.8 + torch cu128 + mamba stack as train.py
 
 Run:
@@ -20,9 +21,13 @@ Run:
     python -u grpo_train.py 2>&1 | tee logs/grpo_$(date +%Y%m%d_%H%M).log
 """
 
+import os
+# B2: must be set before transformers/trl import their remote-code machinery, otherwise
+# deep code paths (ref-model / config reload) can fail on the custom NemotronH model.
+os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+
 import gc
 import json
-import os
 import sys
 import time
 
@@ -67,11 +72,12 @@ print(
 # ─── Imports ───────────────────────────────────────────────────────────
 import torch
 from datasets import Dataset
-from peft import PeftModel
+from peft import LoraConfig, get_peft_model
+from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, "/workspace")  # W4: solvers package lives at /workspace/solvers on the pod
 from solvers.solver import extract_boxed_answer, solve_puzzle, verify_answer
 
 # ─── Load base + SFT adapter ───────────────────────────────────────────
@@ -93,8 +99,37 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 print(f"[model] base loaded in {time.time()-_t:.1f}s", flush=True)
 
-print(f"[model] loading SFT adapter from {SFT_ADAPTER}", flush=True)
-model = PeftModel.from_pretrained(base, SFT_ADAPTER, is_trainable=True)
+print(f"[model] loading SFT adapter from {SFT_ADAPTER} (manual load)", flush=True)
+# B1: PeftModel.from_pretrained crashes on peft 0.19 + transformers 5.x
+# ("WeightConverter ... unexpected kwarg distributed_operation"). Build the adapter manually:
+# LoraConfig from adapter_config.json -> get_peft_model -> load the safetensors, injecting the
+# ".default" adapter name that peft strips when it saves.
+with open(os.path.join(SFT_ADAPTER, "adapter_config.json")) as _f:
+    _acfg = json.load(_f)
+lora_config = LoraConfig(
+    r=_acfg["r"],
+    lora_alpha=_acfg["lora_alpha"],
+    lora_dropout=_acfg.get("lora_dropout", 0.0),
+    bias=_acfg.get("bias", "none"),
+    target_modules=_acfg["target_modules"],
+    task_type="CAUSAL_LM",
+)  # inference_mode defaults False -> adapter stays trainable for GRPO
+model = get_peft_model(base, lora_config)
+
+_adapter_sd = load_file(os.path.join(SFT_ADAPTER, "adapter_model.safetensors"))
+_remapped = {}
+for _k, _v in _adapter_sd.items():
+    if "lora_" in _k and _k.endswith(".weight"):
+        _remapped[_k[: -len(".weight")] + ".default.weight"] = _v
+    else:
+        _remapped[_k] = _v
+_missing, _unexpected = model.load_state_dict(_remapped, strict=False)
+# Base weights are legitimately "missing"; every LoRA slot must be filled and every adapter
+# tensor we supplied must land somewhere. A silent miss here = zero learning signal in GRPO.
+_missing_lora = [k for k in _missing if "lora_" in k]
+assert not _unexpected, f"adapter keys not consumed: {_unexpected[:5]} (+{len(_unexpected)} total)"
+assert not _missing_lora, f"LoRA params left uninitialized: {_missing_lora[:5]} (+{len(_missing_lora)} total)"
+print(f"[model] adapter loaded: {len(_remapped)} tensors, all LoRA slots filled", flush=True)
 model.print_trainable_parameters()
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
