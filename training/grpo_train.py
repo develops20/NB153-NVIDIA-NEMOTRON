@@ -9,8 +9,9 @@ Prerequisites:
   - SFT adapter at SFT_ADAPTER (adapter_config.json + adapter_model.safetensors)
   - sft_train.jsonl in DATA_DIR — ground truth comes from assistant \\boxed{} in each row
     (NOT from train.csv; CSV was consumed at JSONL generation time)
-  - trl 1.4 (pip install "trl>=1.4,<1.5") — matches the transformers 5.x used for SFT;
-    the old trl-0.29.1 wheel is stale (predates transformers 5) and is NOT used here
+  - trl 1.6.0 (pip install trl==1.6.0 --no-deps) — matches transformers 5.x used for SFT;
+    --no-deps protects the cu128 torch/mamba stack. The old trl-0.29.1 wheel is stale (predates
+    transformers 5) and is NOT used.
   - Same CUDA 12.8 + torch cu128 + mamba stack as train.py
 
 Run:
@@ -60,6 +61,9 @@ SOLVER_BONUS = float(os.environ.get("GRPO_SOLVER_BONUS", "0.1"))
 GRPO_MAX_ROWS = os.environ.get("GRPO_MAX_ROWS")  # optional cap for smoke tests
 GRPO_MAX_ROWS = int(GRPO_MAX_ROWS) if GRPO_MAX_ROWS else None
 DEBUG_REWARDS = os.environ.get("GRPO_DEBUG_REWARDS") == "1"  # dump (gt, pred, completion) per sample
+# Skip puzzle types the model already aces (zero GRPO gradient) so slow steps aren't wasted.
+# Comma-separated classify_puzzle names, e.g. "gravity,unit_conversion,roman_numeral". Empty = keep all.
+GRPO_SKIP_TYPES = {t.strip() for t in os.environ.get("GRPO_SKIP_TYPES", "").split(",") if t.strip()}
 
 print(f"[init] SFT_ADAPTER={SFT_ADAPTER}", flush=True)
 print(f"[init] OUTPUT_DIR={OUTPUT_DIR} | DATA_DIR={DATA_DIR}", flush=True)
@@ -79,7 +83,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
 sys.path.insert(0, "/workspace")  # W4: solvers package lives at /workspace/solvers on the pod
-from solvers.solver import extract_boxed_answer, solve_puzzle, verify_answer
+from solvers.solver import classify_puzzle, extract_boxed_answer, solve_puzzle, verify_answer
 
 # ─── Load base + SFT adapter ───────────────────────────────────────────
 for req in ("adapter_config.json", "adapter_model.safetensors"):
@@ -148,8 +152,13 @@ def load_grpo_examples(path: str, max_rows: int | None = None) -> list[dict]:
 def build_grpo_dataset(raw_examples: list[dict]) -> Dataset:
     prompts, answers, user_prompts = [], [], []
     skipped = 0
+    skipped_type = 0
     for ex in raw_examples:
         msgs = ex["messages"]
+        user_text = msgs[1]["content"]
+        if GRPO_SKIP_TYPES and classify_puzzle(user_text) in GRPO_SKIP_TYPES:
+            skipped_type += 1
+            continue
         prompt_text = tokenizer.apply_chat_template(
             msgs[:2], tokenize=False, add_generation_prompt=True
         )
@@ -159,8 +168,12 @@ def build_grpo_dataset(raw_examples: list[dict]) -> Dataset:
             continue
         prompts.append(prompt_text)
         answers.append(gt)
-        user_prompts.append(msgs[1]["content"])
-    print(f"[data] GRPO prompts={len(prompts)} skipped={skipped}", flush=True)
+        user_prompts.append(user_text)
+    print(
+        f"[data] GRPO prompts={len(prompts)} skipped_noboxed={skipped} "
+        f"skipped_type={skipped_type} (skip={sorted(GRPO_SKIP_TYPES) or 'none'})",
+        flush=True,
+    )
     return Dataset.from_dict({
         "prompt": prompts,
         "ground_truth": answers,

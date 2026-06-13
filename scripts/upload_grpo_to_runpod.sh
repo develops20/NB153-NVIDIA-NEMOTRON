@@ -16,7 +16,7 @@ if [[ -f "$ROOT/raw-data/train.csv" ]]; then
 fi
 
 echo "Done. On pod run:"
-echo "  pip install 'trl>=1.4,<1.5' datasets   # trl 1.4 matches transformers 5.x; NOT the old 0.29.1 wheel"
-echo "  pip show trl transformers              # confirm trl 1.4.x + transformers 5.11 before running"
+echo "  pip install trl==1.6.0 --no-deps       # --no-deps protects the cu128 torch/mamba stack (datasets already installed in §3.5)"
+echo "  pip show trl transformers torch        # confirm trl 1.6.0 + transformers 5.x + torch 2.8.0+cu128"
 echo "  export SFT_ADAPTER=/workspace/output OUTPUT_DIR=/workspace/output_grpo DATA_DIR=/workspace/data"
 echo "  python -u /workspace/grpo_train.py 2>&1 | tee logs/grpo_\$(date +%Y%m%d_%H%M).log"
