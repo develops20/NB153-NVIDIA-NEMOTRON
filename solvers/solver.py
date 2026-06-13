@@ -67,12 +67,22 @@ def solve_puzzle(prompt: str, *, answer_hint: str | None = None) -> tuple[str, s
 
 
 def verify_answer(predicted: str, ground_truth: str) -> float:
-    """1.0 for exact match or float within 1e-2 relative tolerance, else 0.0."""
-    if predicted.strip() == ground_truth.strip():
+    """1.0 for exact match; 1e-2 relative tolerance applies ONLY to genuinely decimal
+    answers (ground truth containing '.').
+
+    Binary/integer/text answers must match exactly. Float tolerance there produces false
+    positives: e.g. bit-manipulation '11000011' vs '11000111' parse to 11,000,011 vs
+    11,000,111 — within 1% as decimals — and digit-arithmetic '1234' vs '1235' likewise.
+    Only gravity/unit-conversion answers (always formatted with a decimal point) need the
+    tolerance for rounding."""
+    p, g = predicted.strip(), ground_truth.strip()
+    if p == g:
         return 1.0
+    if "." not in g:
+        return 0.0  # exact-match domain (bit, cipher, roman, digit-arithmetic, symbol)
     try:
-        pred_f = float(predicted)
-        gt_f = float(ground_truth)
+        pred_f = float(p)
+        gt_f = float(g)
         if abs(gt_f) < 1e-9:
             return 1.0 if abs(pred_f) < 1e-9 else 0.0
         rel_diff = abs(pred_f - gt_f) / (abs(gt_f) + 1e-9)

@@ -56,6 +56,8 @@ GRAD_ACCUM = int(os.environ.get("GRPO_GRAD_ACCUM", "4"))
 NUM_EPOCHS = int(os.environ.get("GRPO_NUM_EPOCHS", "1"))
 MAX_STEPS = int(os.environ.get("GRPO_MAX_STEPS", "0"))  # 0 = use num_train_epochs
 SAVE_STEPS = int(os.environ.get("GRPO_SAVE_STEPS", "500"))
+SAVE_TOTAL_LIMIT = int(os.environ.get("GRPO_SAVE_TOTAL_LIMIT", "3"))  # keep last N ckpts (optimizer.pt is big!)
+RESUME = os.environ.get("GRPO_RESUME", "")  # checkpoint path, or "1"/"true" for latest in OUTPUT_DIR
 LOGGING_STEPS = int(os.environ.get("GRPO_LOGGING_STEPS", "10"))
 SOLVER_BONUS = float(os.environ.get("GRPO_SOLVER_BONUS", "0.1"))
 GRPO_MAX_ROWS = os.environ.get("GRPO_MAX_ROWS")  # optional cap for smoke tests
@@ -258,6 +260,7 @@ grpo_kwargs = dict(
     bf16=True,
     logging_steps=LOGGING_STEPS,
     save_steps=SAVE_STEPS,
+    save_total_limit=SAVE_TOTAL_LIMIT,  # prune old checkpoints (optimizer.pt is ~3.5GB each) -> no disk-full
     report_to="none",
     remove_unused_columns=False,
 )
@@ -279,7 +282,15 @@ grpo_trainer = GRPOTrainer(
     callbacks=[GRPOLoggingCallback()],
 )
 
-grpo_trainer.train()
+if RESUME.lower() in ("1", "true", "yes"):
+    resume_arg = True   # auto-detect latest checkpoint-* in OUTPUT_DIR
+elif RESUME:
+    resume_arg = RESUME  # explicit checkpoint dir
+else:
+    resume_arg = None
+if resume_arg:
+    print(f"[train] resuming from {resume_arg}", flush=True)
+grpo_trainer.train(resume_from_checkpoint=resume_arg)
 grpo_trainer.save_model(OUTPUT_DIR)
 model.save_pretrained(OUTPUT_DIR)
 print(f"[save] adapter written to {OUTPUT_DIR}", flush=True)
