@@ -59,6 +59,7 @@ LOGGING_STEPS = int(os.environ.get("GRPO_LOGGING_STEPS", "10"))
 SOLVER_BONUS = float(os.environ.get("GRPO_SOLVER_BONUS", "0.1"))
 GRPO_MAX_ROWS = os.environ.get("GRPO_MAX_ROWS")  # optional cap for smoke tests
 GRPO_MAX_ROWS = int(GRPO_MAX_ROWS) if GRPO_MAX_ROWS else None
+DEBUG_REWARDS = os.environ.get("GRPO_DEBUG_REWARDS") == "1"  # dump (gt, pred, completion) per sample
 
 print(f"[init] SFT_ADAPTER={SFT_ADAPTER}", flush=True)
 print(f"[init] OUTPUT_DIR={OUTPUT_DIR} | DATA_DIR={DATA_DIR}", flush=True)
@@ -178,6 +179,8 @@ def reward_correctness(prompts, completions, ground_truth, user_prompt=None, **k
         predicted = extract_boxed_answer(completion)
         if predicted is None:
             rewards.append(0.0)
+            if DEBUG_REWARDS:
+                print(f"[rw] gt={str(gt)[:45]!r} pred=None score=0.0 | compl[:160]={completion[:160]!r}", flush=True)
             continue
         score = verify_answer(predicted, gt)
         if score >= 1.0 and SOLVER_BONUS > 0:
@@ -185,6 +188,12 @@ def reward_correctness(prompts, completions, ground_truth, user_prompt=None, **k
             if solver_answer and verify_answer(predicted, solver_answer) >= 1.0:
                 score = min(1.0 + SOLVER_BONUS, 1.5)
         rewards.append(float(score))
+        if DEBUG_REWARDS:
+            print(
+                f"[rw] gt={str(gt)[:45]!r} pred={str(predicted)[:45]!r} score={score} "
+                f"| compl[:120]={completion[:120]!r}",
+                flush=True,
+            )
     return rewards
 
 
